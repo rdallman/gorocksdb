@@ -33,6 +33,8 @@
 #if defined(LEVELDB_PLATFORM_ANDROID)
 #include <sys/stat.h>
 #endif
+#include <signal.h>
+#include <algorithm>
 #include "rocksdb/env.h"
 #include "rocksdb/slice.h"
 #include "port/port.h"
@@ -40,7 +42,8 @@
 #include "util/logging.h"
 #include "util/posix_logger.h"
 #include "util/random.h"
-#include <signal.h>
+#include "util/iostats_context_imp.h"
+#include "util/rate_limiter.h"
 
 // Get nano time for mach systems
 #ifdef __MACH__
@@ -178,6 +181,7 @@ class PosixSequentialFile: public SequentialFile {
     do {
       r = fread_unlocked(scratch, 1, n, file_);
     } while (r == 0 && ferror(file_) && errno == EINTR);
+    IOSTATS_ADD(bytes_read, r);
     *result = Slice(scratch, r);
     if (r < n) {
       if (feof(file_)) {
@@ -241,6 +245,7 @@ class PosixRandomAccessFile: public RandomAccessFile {
     do {
       r = pread(fd_, scratch, n, static_cast<off_t>(offset));
     } while (r < 0 && errno == EINTR);
+    IOSTATS_ADD_IF_POSITIVE(bytes_read, r);
     *result = Slice(scratch, (r < 0) ? 0 : r);
     if (r < 0) {
       // An error: return a non-ok status
@@ -488,6 +493,7 @@ class PosixMmapFile : public WritableFile {
 
       size_t n = (left <= avail) ? left : avail;
       memcpy(dst_, src, n);
+      IOSTATS_ADD(bytes_written, n);
       dst_ += n;
       src += n;
       left -= n;
@@ -630,6 +636,7 @@ class PosixWritableFile : public WritableFile {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   bool fallocate_with_keep_size_;
 #endif
+  RateLimiter* rate_limiter_;
 
  public:
   PosixWritableFile(const std::string& fname, int fd, size_t capacity,
@@ -643,7 +650,8 @@ class PosixWritableFile : public WritableFile {
         pending_sync_(false),
         pending_fsync_(false),
         last_sync_size_(0),
-        bytes_per_sync_(options.bytes_per_sync) {
+        bytes_per_sync_(options.bytes_per_sync),
+        rate_limiter_(options.rate_limiter) {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
     fallocate_with_keep_size_ = options.fallocate_with_keep_size;
 #endif
@@ -687,13 +695,14 @@ class PosixWritableFile : public WritableFile {
       cursize_ += left;
     } else {
       while (left != 0) {
-        ssize_t done = write(fd_, src, left);
+        ssize_t done = write(fd_, src, RequestToken(left));
         if (done < 0) {
           if (errno == EINTR) {
             continue;
           }
           return IOError(filename_, errno);
         }
+        IOSTATS_ADD(bytes_written, done);
         TEST_KILL_RANDOM(rocksdb_kill_odds);
 
         left -= done;
@@ -737,13 +746,14 @@ class PosixWritableFile : public WritableFile {
     size_t left = cursize_;
     char* src = buf_.get();
     while (left != 0) {
-      ssize_t done = write(fd_, src, left);
+      ssize_t done = write(fd_, src, RequestToken(left));
       if (done < 0) {
         if (errno == EINTR) {
           continue;
         }
         return IOError(filename_, errno);
       }
+      IOSTATS_ADD(bytes_written, done);
       TEST_KILL_RANDOM(rocksdb_kill_odds * REDUCE_ODDS2);
       left -= done;
       src += done;
@@ -821,7 +831,7 @@ class PosixWritableFile : public WritableFile {
     }
   }
 
-  virtual Status RangeSync(off64_t offset, off64_t nbytes) {
+  virtual Status RangeSync(off_t offset, off_t nbytes) {
     if (sync_file_range(fd_, offset, nbytes, SYNC_FILE_RANGE_WRITE) == 0) {
       return Status::OK();
     } else {
@@ -832,6 +842,16 @@ class PosixWritableFile : public WritableFile {
     return GetUniqueIdFromFile(fd_, id, max_size);
   }
 #endif
+
+ private:
+  inline size_t RequestToken(size_t bytes) {
+    if (rate_limiter_ && io_priority_ < Env::IO_TOTAL) {
+      bytes = std::min(bytes,
+          static_cast<size_t>(rate_limiter_->GetSingleBurstBytes()));
+      rate_limiter_->Request(bytes, io_priority_);
+    }
+    return bytes;
+  }
 };
 
 class PosixRandomRWFile : public RandomRWFile {
@@ -877,6 +897,7 @@ class PosixRandomRWFile : public RandomRWFile {
         }
         return IOError(filename_, errno);
       }
+      IOSTATS_ADD(bytes_written, done);
 
       left -= done;
       src += done;
@@ -890,6 +911,7 @@ class PosixRandomRWFile : public RandomRWFile {
                       char* scratch) const {
     Status s;
     ssize_t r = pread(fd_, scratch, n, static_cast<off_t>(offset));
+    IOSTATS_ADD_IF_POSITIVE(bytes_read, r);
     *result = Slice(scratch, (r < 0) ? 0 : r);
     if (r < 0) {
       s = IOError(filename_, errno);
@@ -1325,8 +1347,8 @@ class PosixEnv : public Env {
     host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
     clock_get_time(cclock, &ts);
     mach_port_deallocate(mach_task_self(), cclock);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
 #endif
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
   }
 
   virtual void SleepForMicroseconds(int micros) {

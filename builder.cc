@@ -40,9 +40,10 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
                   const InternalKeyComparator& internal_comparator,
                   const SequenceNumber newest_snapshot,
                   const SequenceNumber earliest_seqno_in_memtable,
-                  const CompressionType compression) {
+                  const CompressionType compression,
+                  const Env::IOPriority io_priority) {
   Status s;
-  meta->file_size = 0;
+  meta->fd.file_size = 0;
   meta->smallest_seqno = meta->largest_seqno = 0;
   iter->SeekToFirst();
 
@@ -54,13 +55,15 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     purge = false;
   }
 
-  std::string fname = TableFileName(dbname, meta->number);
+  std::string fname = TableFileName(options.db_paths, meta->fd.GetNumber(),
+                                    meta->fd.GetPathId());
   if (iter->Valid()) {
     unique_ptr<WritableFile> file;
     s = env->NewWritableFile(fname, &file, soptions);
     if (!s.ok()) {
       return s;
     }
+    file->SetIOPriority(io_priority);
 
     TableBuilder* builder =
         NewTableBuilder(options, internal_comparator, file.get(), compression);
@@ -177,8 +180,8 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     if (s.ok()) {
       s = builder->Finish();
       if (s.ok()) {
-        meta->file_size = builder->FileSize();
-        assert(meta->file_size > 0);
+        meta->fd.file_size = builder->FileSize();
+        assert(meta->fd.GetFileSize() > 0);
       }
     } else {
       builder->Abandon();
@@ -202,7 +205,7 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     if (s.ok()) {
       // Verify that the table is usable
       Iterator* it = table_cache->NewIterator(ReadOptions(), soptions,
-                                              internal_comparator, *meta);
+                                              internal_comparator, meta->fd);
       s = it->status();
       delete it;
     }
@@ -213,7 +216,7 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     s = iter->status();
   }
 
-  if (s.ok() && meta->file_size > 0) {
+  if (s.ok() && meta->fd.GetFileSize() > 0) {
     // Keep it
   } else {
     env->DeleteFile(fname);

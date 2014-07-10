@@ -5,11 +5,11 @@
 
 #pragma once
 
+#include <util/arena.h>
+#include <port/port_posix.h>
+
 #include <atomic>
 #include <memory>
-
-#include "port/port.h"
-#include <util/arena.h>
 
 namespace rocksdb {
 
@@ -18,6 +18,7 @@ class Logger;
 
 class DynamicBloom {
  public:
+  // arena: pass arena to bloom filter, hence trace the usage of memory
   // total_bits: fixed total bits for the bloom
   // num_probes: number of hash probes for a single key
   // locality:  If positive, optimize for cache line locality, 0 otherwise.
@@ -27,7 +28,8 @@ class DynamicBloom {
   //                      it to be allocated, like:
   //                         sysctl -w vm.nr_hugepages=20
   //                     See linux doc Documentation/vm/hugetlbpage.txt
-  explicit DynamicBloom(uint32_t total_bits, uint32_t locality = 0,
+  explicit DynamicBloom(Arena* arena,
+                        uint32_t total_bits, uint32_t locality = 0,
                         uint32_t num_probes = 6,
                         uint32_t (*hash_func)(const Slice& key) = nullptr,
                         size_t huge_page_tlb_size = 0,
@@ -36,7 +38,7 @@ class DynamicBloom {
   explicit DynamicBloom(uint32_t num_probes = 6,
                         uint32_t (*hash_func)(const Slice& key) = nullptr);
 
-  void SetTotalBits(uint32_t total_bits, uint32_t locality,
+  void SetTotalBits(Arena* arena, uint32_t total_bits, uint32_t locality,
                     size_t huge_page_tlb_size, Logger* logger);
 
   ~DynamicBloom() {}
@@ -53,6 +55,8 @@ class DynamicBloom {
   // Multithreaded access to this function is OK
   bool MayContainHash(uint32_t hash) const;
 
+  void Prefetch(uint32_t h);
+
  private:
   uint32_t kTotalBits;
   uint32_t kNumBlocks;
@@ -61,14 +65,19 @@ class DynamicBloom {
   uint32_t (*hash_func_)(const Slice& key);
   unsigned char* data_;
   unsigned char* raw_;
-
-  Arena arena_;
 };
 
 inline void DynamicBloom::Add(const Slice& key) { AddHash(hash_func_(key)); }
 
 inline bool DynamicBloom::MayContain(const Slice& key) const {
   return (MayContainHash(hash_func_(key)));
+}
+
+inline void DynamicBloom::Prefetch(uint32_t h) {
+  if (kNumBlocks != 0) {
+    uint32_t b = ((h >> 11 | (h << 21)) % kNumBlocks) * (CACHE_LINE_SIZE * 8);
+    PREFETCH(&(data_[b]), 0, 3);
+  }
 }
 
 inline bool DynamicBloom::MayContainHash(uint32_t h) const {
