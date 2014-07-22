@@ -43,6 +43,9 @@ func TestColumnFamilies(t *testing.T) {
 		testdb, cfmissing, err := OpenDbWithColumnFamilies(opts, missingdb, cfds)
 		So(err, ShouldBeNil)
 		So(len(cfmissing), ShouldEqual, 2)
+		for _, cf := range cfmissing {
+			cf.Destroy()
+		}
 		testdb.Close()
 
 		wo := NewDefaultWriteOptions()
