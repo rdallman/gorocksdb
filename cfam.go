@@ -40,7 +40,9 @@ func (cf *ColumnFamily) Destroy() {
 func ListColumnFamilies(dbOpts *Options, name string) ([]string, error) {
 	var len C.size_t
 	var cErr *C.char
-	cfs := C.rocksdb_list_column_families(dbOpts.c, stringToChar(name), &len, &cErr)
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	cfs := C.rocksdb_list_column_families(dbOpts.c, cname, &len, &cErr)
 	if cErr != nil {
 		defer C.free(unsafe.Pointer(cErr))
 		return nil, errors.New(C.GoString(cErr))
@@ -65,7 +67,9 @@ func OpenDbWithColumnFamilies(dbOpts *Options, name string, cfds []ColumnFamilyD
 	cfNames, cfOpts := cfdsToNameOpts(cfds)
 	handles := make([]*C.rocksdb_column_family_handle_t, len)
 
-	db := C.rocksdb_open_column_families(dbOpts.c, stringToChar(name),
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	db := C.rocksdb_open_column_families(dbOpts.c, cname,
 		C.int(len), &cfNames[0], &cfOpts[0], &handles[0], &cErr)
 	if cErr != nil {
 		defer C.free(unsafe.Pointer(cErr))
@@ -87,7 +91,9 @@ func OpenDbForReadOnlyWithColumnFamilies(dbOpts *Options, name string, cfds []Co
 	cfNames, cfOpts := cfdsToNameOpts(cfds)
 	handles := make([]*C.rocksdb_column_family_handle_t, len)
 
-	db := C.rocksdb_open_for_read_only_column_families(dbOpts.c, stringToChar(name),
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	db := C.rocksdb_open_for_read_only_column_families(dbOpts.c, cname,
 		C.int(len), &cfNames[0], &cfOpts[0], &handles[0], boolToChar(errorIfLogFileExist), &cErr)
 	if cErr != nil {
 		defer C.free(unsafe.Pointer(cErr))
@@ -116,7 +122,9 @@ func cfdsToNameOpts(cfds []ColumnFamilyDescriptor) ([]*C.char, []*C.rocksdb_opti
 func (self *DB) CreateColumnFamily(cfd ColumnFamilyDescriptor) (*ColumnFamily, error) {
 	var cErr *C.char
 
-	cf := C.rocksdb_create_column_family(self.c, cfd.Opts.c, stringToChar(cfd.Name), &cErr)
+	cname := C.CString(cfd.Name)
+	defer C.free(unsafe.Pointer(cname))
+	cf := C.rocksdb_create_column_family(self.c, cfd.Opts.c, cname, &cErr)
 	if cErr != nil {
 		defer C.free(unsafe.Pointer(cErr))
 		return nil, errors.New(C.GoString(cErr))
@@ -202,7 +210,9 @@ func (self *DB) NewIteratorCF(opts *ReadOptions, cf *ColumnFamily) *Iterator {
 
 // GetPropertyCF returns the value of a database property for a column family.
 func (self *DB) GetPropertyCF(cf *ColumnFamily, propName string) string {
-	cValue := C.rocksdb_property_value_cf(self.c, cf.c, stringToChar(propName))
+	cprop := C.CString(propName)
+	defer C.free(unsafe.Pointer(cprop))
+	cValue := C.rocksdb_property_value_cf(self.c, cf.c, cprop)
 	defer C.free(unsafe.Pointer(cValue))
 	return C.GoString(cValue)
 }

@@ -525,7 +525,9 @@ func (self *Options) SetDbStatsLogInterval(value int) {
 // name's prefix.
 // Default: empty
 func (self *Options) SetDbLogDir(value string) {
-	C.rocksdb_options_set_db_log_dir(self.c, stringToChar(value))
+	cvalue := C.CString(value)
+	defer C.free(unsafe.Pointer(cvalue))
+	C.rocksdb_options_set_db_log_dir(self.c, cvalue)
 }
 
 // This specifies the absolute dir path for write-ahead logs (WAL).
@@ -534,7 +536,9 @@ func (self *Options) SetDbLogDir(value string) {
 // When destroying the db, all log files and the dir itself is deleted.
 // Default: empty
 func (self *Options) SetWalDir(value string) {
-	C.rocksdb_options_set_wal_dir(self.c, stringToChar(value))
+	cvalue := C.CString(value)
+	defer C.free(unsafe.Pointer(cvalue))
+	C.rocksdb_options_set_wal_dir(self.c, cvalue)
 }
 
 // Disable compaction triggered by seek.
