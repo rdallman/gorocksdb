@@ -276,6 +276,7 @@ Options SanitizeOptions(const std::string& dbname,
 
 DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
   DBOptions result = src;
+
   // result.max_open_files means an "infinite" open files.
   if (result.max_open_files != -1) {
     ClipToRange(&result.max_open_files, 20, 1000000);
@@ -299,7 +300,7 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
   }
 
   if (result.db_paths.size() == 0) {
-    result.db_paths.push_back(dbname);
+    result.db_paths.emplace_back(dbname, std::numeric_limits<uint64_t>::max());
   }
 
   return result;
@@ -334,6 +335,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
     : env_(options.env),
       dbname_(dbname),
       options_(SanitizeOptions(dbname, options)),
+      stats_(options_.statistics.get()),
       db_lock_(nullptr),
       mutex_(options.use_adaptive_mutex),
       shutting_down_(nullptr),
@@ -348,9 +350,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
       bg_compaction_scheduled_(0),
       bg_manual_only_(0),
       bg_flush_scheduled_(0),
-      bg_logstats_scheduled_(false),
       manual_compaction_(nullptr),
-      logger_(nullptr),
       disable_delete_obsolete_files_(0),
       delete_obsolete_files_last_run_(options.env->NowMicros()),
       purge_wal_files_last_run_(0),
@@ -381,16 +381,6 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
   DumpLeveldbBuildVersion(options_.info_log.get());
   options_.Dump(options_.info_log.get());
 
-  char name[100];
-  Status s = env_->GetHostName(name, 100L);
-  if (s.ok()) {
-    host_name_ = name;
-  } else {
-    Log(options_.info_log, "Can't get hostname, use localhost as host name.");
-    host_name_ = "localhost";
-  }
-  last_log_ts = 0;
-
   LogFlush(options_.info_log);
 }
 
@@ -411,9 +401,7 @@ DBImpl::~DBImpl() {
 
   // Wait for background work to finish
   shutting_down_.Release_Store(this);  // Any non-nullptr value is ok
-  while (bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ ||
-         bg_logstats_scheduled_) {
+  while (bg_compaction_scheduled_ || bg_flush_scheduled_) {
     bg_cv_.Wait();
   }
 
@@ -524,9 +512,22 @@ void DBImpl::MaybeDumpStats() {
     // atomically. We could see more than one dump during one dump
     // period in rare cases.
     last_stats_dump_time_microsec_ = now_micros;
+
+    DBPropertyType cf_property_type = GetPropertyType("rocksdb.cfstats");
+    DBPropertyType db_property_type = GetPropertyType("rocksdb.dbstats");
     std::string stats;
-    GetProperty("rocksdb.stats", &stats);
+    {
+      MutexLock l(&mutex_);
+      for (auto cfd : *versions_->GetColumnFamilySet()) {
+        cfd->internal_stats()->GetProperty(
+            cf_property_type, "rocksdb.cfstats", &stats);
+      }
+      default_cf_internal_stats_->GetProperty(
+          db_property_type, "rocksdb.dbstats", &stats);
+    }
+    Log(options_.info_log, "------- DUMPING STATS -------");
     Log(options_.info_log, "%s", stats.c_str());
+
     PrintStatistics();
   }
 }
@@ -1119,8 +1120,8 @@ Status DBImpl::Recover(
       return s;
     }
 
-    for (auto db_path : options_.db_paths) {
-      s = env_->CreateDirIfMissing(db_path);
+    for (auto& db_path : options_.db_paths) {
+      s = env_->CreateDirIfMissing(db_path.path);
       if (!s.ok()) {
         return s;
       }
@@ -1171,6 +1172,7 @@ Status DBImpl::Recover(
     SequenceNumber max_sequence(0);
     default_cf_handle_ = new ColumnFamilyHandleImpl(
         versions_->GetColumnFamilySet()->GetDefault(), this, &mutex_);
+    default_cf_internal_stats_ = default_cf_handle_->cfd()->internal_stats();
     single_column_family_mode_ =
         versions_->GetColumnFamilySet()->NumberOfColumnFamilies() == 1;
 
@@ -1220,8 +1222,7 @@ Status DBImpl::Recover(
       versions_->MarkFileNumberUsed(log);
       s = RecoverLogFile(log, &max_sequence, read_only);
     }
-    SetTickerCount(options_.statistics.get(), SEQUENCE_NUMBER,
-                   versions_->LastSequence());
+    SetTickerCount(stats_, SEQUENCE_NUMBER, versions_->LastSequence());
   }
 
   for (auto cfd : *versions_->GetColumnFamilySet()) {
@@ -1428,13 +1429,14 @@ Status DBImpl::WriteLevel0TableForRecovery(ColumnFamilyData* cfd, MemTable* mem,
                   meta.smallest_seqno, meta.largest_seqno);
   }
 
-  InternalStats::CompactionStats stats;
+  InternalStats::CompactionStats stats(1);
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.fd.GetFileSize();
   stats.files_out_levelnp1 = 1;
   cfd->internal_stats()->AddCompactionStats(level, stats);
-  RecordTick(options_.statistics.get(), COMPACT_WRITE_BYTES,
-             meta.fd.GetFileSize());
+  cfd->internal_stats()->AddCFStats(
+      InternalStats::BYTES_FLUSHED, meta.fd.GetFileSize());
+  RecordTick(stats_, COMPACT_WRITE_BYTES, meta.fd.GetFileSize());
   return s;
 }
 
@@ -1478,7 +1480,7 @@ Status DBImpl::WriteLevel0Table(ColumnFamilyData* cfd,
     delete iter;
     Log(options_.info_log,
         "[%s] Level-0 flush table #%" PRIu64 ": %" PRIu64 " bytes %s",
-        cfd->GetName().c_str(), meta.fd.GetFileSize(), meta.fd.GetFileSize(),
+        cfd->GetName().c_str(), meta.fd.GetNumber(), meta.fd.GetFileSize(),
         s.ToString().c_str());
 
     if (!options_.disableDataSync) {
@@ -1519,12 +1521,13 @@ Status DBImpl::WriteLevel0Table(ColumnFamilyData* cfd,
                   meta.smallest_seqno, meta.largest_seqno);
   }
 
-  InternalStats::CompactionStats stats;
+  InternalStats::CompactionStats stats(1);
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.fd.GetFileSize();
   cfd->internal_stats()->AddCompactionStats(level, stats);
-  RecordTick(options_.statistics.get(), COMPACT_WRITE_BYTES,
-             meta.fd.GetFileSize());
+  cfd->internal_stats()->AddCFStats(
+      InternalStats::BYTES_FLUSHED, meta.fd.GetFileSize());
+  RecordTick(stats_, COMPACT_WRITE_BYTES, meta.fd.GetFileSize());
   return s;
 }
 
@@ -1585,8 +1588,6 @@ Status DBImpl::FlushMemTableToOutputFile(ColumnFamilyData* cfd,
     LogToBuffer(log_buffer, "[%s] Level summary: %s\n", cfd->GetName().c_str(),
                 cfd->current()->LevelSummary(&tmp));
 
-    MaybeScheduleLogDBDeployStats();
-
     if (disable_delete_obsolete_files_ == 0) {
       // add to deletion state
       while (alive_log_files_.size() &&
@@ -1611,7 +1612,12 @@ Status DBImpl::FlushMemTableToOutputFile(ColumnFamilyData* cfd,
 
 Status DBImpl::CompactRange(ColumnFamilyHandle* column_family,
                             const Slice* begin, const Slice* end,
-                            bool reduce_level, int target_level) {
+                            bool reduce_level, int target_level,
+                            uint32_t target_path_id) {
+  if (target_path_id >= options_.db_paths.size()) {
+    return Status::InvalidArgument("Invalid target path ID");
+  }
+
   auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
   auto cfd = cfh->cfd();
 
@@ -1637,9 +1643,10 @@ Status DBImpl::CompactRange(ColumnFamilyHandle* column_family,
     if (cfd->options()->compaction_style == kCompactionStyleUniversal ||
         cfd->options()->compaction_style == kCompactionStyleFIFO ||
         level == max_level_with_files) {
-      s = RunManualCompaction(cfd, level, level, begin, end);
+      s = RunManualCompaction(cfd, level, level, target_path_id, begin, end);
     } else {
-      s = RunManualCompaction(cfd, level, level + 1, begin, end);
+      s = RunManualCompaction(cfd, level, level + 1, target_path_id, begin,
+                              end);
     }
     if (!s.ok()) {
       LogFlush(options_.info_log);
@@ -1772,8 +1779,8 @@ SequenceNumber DBImpl::GetLatestSequenceNumber() const {
 }
 
 Status DBImpl::RunManualCompaction(ColumnFamilyData* cfd, int input_level,
-                                   int output_level, const Slice* begin,
-                                   const Slice* end) {
+                                   int output_level, uint32_t output_path_id,
+                                   const Slice* begin, const Slice* end) {
   assert(input_level >= 0);
 
   InternalKey begin_storage, end_storage;
@@ -1782,6 +1789,7 @@ Status DBImpl::RunManualCompaction(ColumnFamilyData* cfd, int input_level,
   manual.cfd = cfd;
   manual.input_level = input_level;
   manual.output_level = output_level;
+  manual.output_path_id = output_path_id;
   manual.done = false;
   manual.in_progress = false;
   // For universal compaction, we enforce every manual compaction to compact
@@ -1923,17 +1931,14 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
 }
 
 void DBImpl::RecordFlushIOStats() {
-  RecordTick(options_.statistics.get(), FLUSH_WRITE_BYTES,
-             iostats_context.bytes_written);
+  RecordTick(stats_, FLUSH_WRITE_BYTES, iostats_context.bytes_written);
   IOSTATS_RESET(bytes_written);
 }
 
 void DBImpl::RecordCompactionIOStats() {
-  RecordTick(options_.statistics.get(), COMPACT_READ_BYTES,
-             IOSTATS(bytes_read));
+  RecordTick(stats_, COMPACT_READ_BYTES, IOSTATS(bytes_read));
   IOSTATS_RESET(bytes_read);
-  RecordTick(options_.statistics.get(), COMPACT_WRITE_BYTES,
-             IOSTATS(bytes_written));
+  RecordTick(stats_, COMPACT_WRITE_BYTES, IOSTATS(bytes_written));
   IOSTATS_RESET(bytes_written);
 }
 
@@ -1995,9 +2000,8 @@ void DBImpl::BackgroundCallFlush() {
         // case this is an environmental problem and we do not want to
         // chew up resources for failed compactions for the duration of
         // the problem.
-        uint64_t error_cnt = default_cf_handle_->cfd()
-                                 ->internal_stats()
-                                 ->BumpAndGetBackgroundErrorCount();
+        uint64_t error_cnt =
+          default_cf_internal_stats_->BumpAndGetBackgroundErrorCount();
         bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
         mutex_.Unlock();
         Log(options_.info_log,
@@ -2063,9 +2067,8 @@ void DBImpl::BackgroundCallCompaction() {
         // case this is an environmental problem and we do not want to
         // chew up resources for failed compactions for the duration of
         // the problem.
-        uint64_t error_cnt = default_cf_handle_->cfd()
-                                 ->internal_stats()
-                                 ->BumpAndGetBackgroundErrorCount();
+        uint64_t error_cnt =
+          default_cf_internal_stats_->BumpAndGetBackgroundErrorCount();
         bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
         mutex_.Unlock();
         log_buffer.FlushBufferToLog();
@@ -2101,8 +2104,6 @@ void DBImpl::BackgroundCallCompaction() {
     }
 
     bg_compaction_scheduled_--;
-
-    MaybeScheduleLogDBDeployStats();
 
     versions_->GetColumnFamilySet()->FreeDeadColumnFamilies();
 
@@ -2178,8 +2179,9 @@ Status DBImpl::BackgroundCompaction(bool* madeProgress,
   if (is_manual) {
     ManualCompaction* m = manual_compaction_;
     assert(m->in_progress);
-    c.reset(m->cfd->CompactRange(m->input_level, m->output_level, m->begin,
-                                 m->end, &manual_end));
+    c.reset(m->cfd->CompactRange(m->input_level, m->output_level,
+                                 m->output_path_id, m->begin, m->end,
+                                 &manual_end));
     if (!c) {
       m->done = true;
     }
@@ -2199,7 +2201,7 @@ Status DBImpl::BackgroundCompaction(bool* madeProgress,
         c.reset(cfd->PickCompaction(log_buffer));
         if (c != nullptr) {
           // update statistics
-          MeasureTime(options_.statistics.get(), NUM_FILES_IN_SINGLE_COMPACTION,
+          MeasureTime(stats_, NUM_FILES_IN_SINGLE_COMPACTION,
                       c->inputs(0)->size());
           break;
         }
@@ -2424,12 +2426,10 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   // Finish and check for file errors
   if (s.ok() && !options_.disableDataSync) {
     if (options_.use_fsync) {
-      StopWatch sw(env_, options_.statistics.get(),
-                   COMPACTION_OUTFILE_SYNC_MICROS, false);
+      StopWatch sw(env_, stats_, COMPACTION_OUTFILE_SYNC_MICROS);
       s = compact->outfile->Fsync();
     } else {
-      StopWatch sw(env_, options_.statistics.get(),
-                   COMPACTION_OUTFILE_SYNC_MICROS, false);
+      StopWatch sw(env_, stats_, COMPACTION_OUTFILE_SYNC_MICROS);
       s = compact->outfile->Sync();
     }
   }
@@ -2661,7 +2661,7 @@ Status DBImpl::ProcessKeyValueCompaction(
             ParseInternalKey(key, &ikey);
             // no value associated with delete
             value.clear();
-            RecordTick(options_.statistics.get(), COMPACTION_KEY_DROP_USER);
+            RecordTick(stats_, COMPACTION_KEY_DROP_USER);
           } else if (value_changed) {
             value = compaction_filter_value;
           }
@@ -2685,10 +2685,10 @@ Status DBImpl::ProcessKeyValueCompaction(
         // TODO: why not > ?
         assert(last_sequence_for_key >= ikey.sequence);
         drop = true;    // (A)
-        RecordTick(options_.statistics.get(), COMPACTION_KEY_DROP_NEWER_ENTRY);
+        RecordTick(stats_, COMPACTION_KEY_DROP_NEWER_ENTRY);
       } else if (ikey.type == kTypeDeletion &&
           ikey.sequence <= earliest_snapshot &&
-          compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
+          compact->compaction->KeyNotExistsBeyondOutputLevel(ikey.user_key)) {
         // For this user key:
         // (1) there is no data in higher levels
         // (2) data in lower levels will have larger sequence numbers
@@ -2697,7 +2697,7 @@ Status DBImpl::ProcessKeyValueCompaction(
         //     few iterations of this loop (by rule (A) above).
         // Therefore this deletion marker is obsolete and can be dropped.
         drop = true;
-        RecordTick(options_.statistics.get(), COMPACTION_KEY_DROP_OBSOLETE);
+        RecordTick(stats_, COMPACTION_KEY_DROP_OBSOLETE);
       } else if (ikey.type == kTypeMerge) {
         // We know the merge type entry is not hidden, otherwise we would
         // have hit (A)
@@ -2887,7 +2887,7 @@ void DBImpl::CallCompactionFilterV2(CompactionState* compact,
 
       // no value associated with delete
       compact->existing_value_buf_[i].clear();
-      RecordTick(options_.statistics.get(), COMPACTION_KEY_DROP_USER);
+      RecordTick(stats_, COMPACTION_KEY_DROP_USER);
     } else if (compact->value_changed_buf_[i]) {
       compact->existing_value_buf_[i] =
         Slice(compact->new_value_buf_[new_value_idx++]);
@@ -2903,6 +2903,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact,
   compact->CleanupMergedBuffer();
   bool prefix_initialized = false;
 
+  // Generate file_levels_ for compaction berfore making Iterator
+  compact->compaction->GenerateFileLevels();
   int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
   ColumnFamilyData* cfd = compact->compaction->column_family_data();
   LogToBuffer(
@@ -3132,11 +3134,11 @@ Status DBImpl::DoCompactionWork(CompactionState* compact,
     db_directory_->Fsync();
   }
 
-  InternalStats::CompactionStats stats;
+  InternalStats::CompactionStats stats(1);
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
-  MeasureTime(options_.statistics.get(), COMPACTION_TIME, stats.micros);
   stats.files_in_leveln = compact->compaction->num_input_files(0);
   stats.files_in_levelnp1 = compact->compaction->num_input_files(1);
+  MeasureTime(stats_, COMPACTION_TIME, stats.micros);
 
   int num_output_files = compact->outputs.size();
   if (compact->builder != nullptr) {
@@ -3162,8 +3164,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact,
 
   LogFlush(options_.info_log);
   mutex_.Lock();
-  cfd->internal_stats()->AddCompactionStats(compact->compaction->output_level(),
-                                            stats);
+  cfd->internal_stats()->AddCompactionStats(
+      compact->compaction->output_level(), stats);
 
   // if there were any unused file number (mostly in case of
   // compaction error), free up the entry from pending_putputs
@@ -3297,7 +3299,7 @@ void DBImpl::InstallSuperVersion(ColumnFamilyData* cfd,
 Status DBImpl::GetImpl(const ReadOptions& options,
                        ColumnFamilyHandle* column_family, const Slice& key,
                        std::string* value, bool* value_found) {
-  StopWatch sw(env_, options_.statistics.get(), DB_GET, false);
+  StopWatch sw(env_, stats_, DB_GET);
   PERF_TIMER_AUTO(get_snapshot_time);
 
   auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
@@ -3332,16 +3334,16 @@ Status DBImpl::GetImpl(const ReadOptions& options,
   PERF_TIMER_STOP(get_snapshot_time);
   if (sv->mem->Get(lkey, value, &s, merge_context, *cfd->options())) {
     // Done
-    RecordTick(options_.statistics.get(), MEMTABLE_HIT);
+    RecordTick(stats_, MEMTABLE_HIT);
   } else if (sv->imm->Get(lkey, value, &s, merge_context, *cfd->options())) {
     // Done
-    RecordTick(options_.statistics.get(), MEMTABLE_HIT);
+    RecordTick(stats_, MEMTABLE_HIT);
   } else {
     PERF_TIMER_START(get_from_output_files_time);
 
     sv->current->Get(options, lkey, value, &s, &merge_context, value_found);
     PERF_TIMER_STOP(get_from_output_files_time);
-    RecordTick(options_.statistics.get(), MEMTABLE_MISS);
+    RecordTick(stats_, MEMTABLE_MISS);
   }
 
   PERF_TIMER_START(get_post_process_time);
@@ -3358,13 +3360,13 @@ Status DBImpl::GetImpl(const ReadOptions& options,
       sv->Cleanup();
       mutex_.Unlock();
       delete sv;
-      RecordTick(options_.statistics.get(), NUMBER_SUPERVERSION_CLEANUPS);
+      RecordTick(stats_, NUMBER_SUPERVERSION_CLEANUPS);
     }
-    RecordTick(options_.statistics.get(), NUMBER_SUPERVERSION_RELEASES);
+    RecordTick(stats_, NUMBER_SUPERVERSION_RELEASES);
   }
 
-  RecordTick(options_.statistics.get(), NUMBER_KEYS_READ);
-  RecordTick(options_.statistics.get(), BYTES_READ, value->size());
+  RecordTick(stats_, NUMBER_KEYS_READ);
+  RecordTick(stats_, BYTES_READ, value->size());
   PERF_TIMER_STOP(get_post_process_time);
   return s;
 }
@@ -3374,7 +3376,7 @@ std::vector<Status> DBImpl::MultiGet(
     const std::vector<ColumnFamilyHandle*>& column_family,
     const std::vector<Slice>& keys, std::vector<std::string>* values) {
 
-  StopWatch sw(env_, options_.statistics.get(), DB_MULTIGET, false);
+  StopWatch sw(env_, stats_, DB_MULTIGET);
   PERF_TIMER_AUTO(get_snapshot_time);
 
   SequenceNumber snapshot;
@@ -3472,9 +3474,9 @@ std::vector<Status> DBImpl::MultiGet(
     delete mgd.second;
   }
 
-  RecordTick(options_.statistics.get(), NUMBER_MULTIGET_CALLS);
-  RecordTick(options_.statistics.get(), NUMBER_MULTIGET_KEYS_READ, num_keys);
-  RecordTick(options_.statistics.get(), NUMBER_MULTIGET_BYTES_READ, bytes_read);
+  RecordTick(stats_, NUMBER_MULTIGET_CALLS);
+  RecordTick(stats_, NUMBER_MULTIGET_KEYS_READ, num_keys);
+  RecordTick(stats_, NUMBER_MULTIGET_BYTES_READ, bytes_read);
   PERF_TIMER_STOP(get_post_process_time);
 
   return stat_list;
@@ -3789,12 +3791,16 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   }
 
   if (!options.disableWAL) {
-    RecordTick(options_.statistics.get(), WRITE_WITH_WAL, 1);
+    RecordTick(stats_, WRITE_WITH_WAL);
+    default_cf_internal_stats_->AddDBStats(
+        InternalStats::WRITE_WITH_WAL, 1);
   }
 
   if (w.done) {
+    default_cf_internal_stats_->AddDBStats(
+        InternalStats::WRITE_DONE_BY_OTHER, 1);
     mutex_.Unlock();
-    RecordTick(options_.statistics.get(), WRITE_DONE_BY_OTHER, 1);
+    RecordTick(stats_, WRITE_DONE_BY_OTHER);
     return w.status;
   } else if (timed_out) {
 #ifndef NDEBUG
@@ -3819,10 +3825,12 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
       writers_.front()->cv.Signal();
     }
     mutex_.Unlock();
-    RecordTick(options_.statistics.get(), WRITE_TIMEDOUT, 1);
+    RecordTick(stats_, WRITE_TIMEDOUT);
     return Status::TimedOut();
   } else {
-    RecordTick(options_.statistics.get(), WRITE_DONE_BY_SELF, 1);
+    RecordTick(stats_, WRITE_DONE_BY_SELF);
+    default_cf_internal_stats_->AddDBStats(
+        InternalStats::WRITE_DONE_BY_SELF, 1);
   }
 
   // Once reaches this point, the current writer "w" will try to do its write
@@ -3908,17 +3916,16 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
       WriteBatchInternal::SetSequence(updates, current_sequence);
       int my_batch_count = WriteBatchInternal::Count(updates);
       last_sequence += my_batch_count;
+      const uint64_t batch_size = WriteBatchInternal::ByteSize(updates);
       // Record statistics
-      RecordTick(options_.statistics.get(),
-                 NUMBER_KEYS_WRITTEN, my_batch_count);
-      RecordTick(options_.statistics.get(),
-                 BYTES_WRITTEN,
-                 WriteBatchInternal::ByteSize(updates));
+      RecordTick(stats_, NUMBER_KEYS_WRITTEN, my_batch_count);
+      RecordTick(stats_, BYTES_WRITTEN, WriteBatchInternal::ByteSize(updates));
       if (options.disableWAL) {
         flush_on_destroy_ = true;
       }
       PERF_TIMER_STOP(write_pre_and_post_process_time);
 
+      uint64_t log_size = 0;
       if (!options.disableWAL) {
         PERF_TIMER_START(write_wal_time);
         Slice log_entry = WriteBatchInternal::Contents(updates);
@@ -3926,14 +3933,15 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
         total_log_size_ += log_entry.size();
         alive_log_files_.back().AddSize(log_entry.size());
         log_empty_ = false;
-        RecordTick(options_.statistics.get(), WAL_FILE_SYNCED, 1);
-        RecordTick(options_.statistics.get(), WAL_FILE_BYTES, log_entry.size());
+        log_size = log_entry.size();
+        RecordTick(stats_, WAL_FILE_SYNCED);
+        RecordTick(stats_, WAL_FILE_BYTES, log_size);
         if (status.ok() && options.sync) {
           if (options_.use_fsync) {
-            StopWatch(env_, options_.statistics.get(), WAL_FILE_SYNC_MICROS);
+            StopWatch(env_, stats_, WAL_FILE_SYNC_MICROS);
             status = log_->file()->Fsync();
           } else {
-            StopWatch(env_, options_.statistics.get(), WAL_FILE_SYNC_MICROS);
+            StopWatch(env_, stats_, WAL_FILE_SYNC_MICROS);
             status = log_->file()->Sync();
           }
         }
@@ -3954,12 +3962,22 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
 
         PERF_TIMER_STOP(write_memtable_time);
 
-        SetTickerCount(options_.statistics.get(), SEQUENCE_NUMBER,
-                       last_sequence);
+        SetTickerCount(stats_, SEQUENCE_NUMBER, last_sequence);
       }
       PERF_TIMER_START(write_pre_and_post_process_time);
-      if (updates == &tmp_batch_) tmp_batch_.Clear();
+      if (updates == &tmp_batch_) {
+        tmp_batch_.Clear();
+      }
       mutex_.Lock();
+      // internal stats
+      default_cf_internal_stats_->AddDBStats(
+          InternalStats::BYTES_WRITTEN, batch_size);
+      if (!options.disableWAL) {
+        default_cf_internal_stats_->AddDBStats(
+            InternalStats::WAL_FILE_SYNCED, 1);
+        default_cf_internal_stats_->AddDBStats(
+            InternalStats::WAL_FILE_BYTES, log_size);
+      }
       if (status.ok()) {
         versions_->SetLastSequence(last_sequence);
       }
@@ -3990,7 +4008,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   mutex_.Unlock();
 
   if (status.IsTimedOut()) {
-    RecordTick(options_.statistics.get(), WRITE_TIMEDOUT, 1);
+    RecordTick(stats_, WRITE_TIMEDOUT);
   }
 
   for (auto& sv : superversions_to_free) {
@@ -4137,15 +4155,14 @@ Status DBImpl::MakeRoomForWrite(
       mutex_.Unlock();
       uint64_t delayed;
       {
-        StopWatch sw(env_, options_.statistics.get(), STALL_L0_SLOWDOWN_COUNT);
+        StopWatch sw(env_, stats_, STALL_L0_SLOWDOWN_COUNT, &delayed);
         env_->SleepForMicroseconds(slowdown);
-        delayed = sw.ElapsedMicros();
       }
-      RecordTick(options_.statistics.get(), STALL_L0_SLOWDOWN_MICROS, delayed);
-      cfd->internal_stats()->RecordWriteStall(InternalStats::LEVEL0_SLOWDOWN,
-                                              delayed);
+      RecordTick(stats_, STALL_L0_SLOWDOWN_MICROS, delayed);
       allow_delay = false;  // Do not delay a single write more than once
       mutex_.Lock();
+      cfd->internal_stats()->AddCFStats(
+          InternalStats::LEVEL0_SLOWDOWN, delayed);
       delayed_writes_++;
     } else if (!force && !cfd->mem()->ShouldFlush()) {
       // There is room in current memtable
@@ -4165,18 +4182,15 @@ Status DBImpl::MakeRoomForWrite(
       }
       uint64_t stall;
       {
-        StopWatch sw(env_, options_.statistics.get(),
-                     STALL_MEMTABLE_COMPACTION_COUNT);
+        StopWatch sw(env_, stats_, STALL_MEMTABLE_COMPACTION_COUNT, &stall);
         if (!has_timeout) {
           bg_cv_.Wait();
         } else {
           bg_cv_.TimedWait(expiration_time);
         }
-        stall = sw.ElapsedMicros();
       }
-      RecordTick(options_.statistics.get(),
-                 STALL_MEMTABLE_COMPACTION_MICROS, stall);
-      cfd->internal_stats()->RecordWriteStall(
+      RecordTick(stats_, STALL_MEMTABLE_COMPACTION_MICROS, stall);
+      cfd->internal_stats()->AddCFStats(
           InternalStats::MEMTABLE_COMPACTION, stall);
     } else if (cfd->NeedWaitForNumLevel0Files()) {
       DelayLoggingAndReset();
@@ -4184,59 +4198,54 @@ Status DBImpl::MakeRoomForWrite(
           cfd->GetName().c_str());
       uint64_t stall;
       {
-        StopWatch sw(env_, options_.statistics.get(),
-                     STALL_L0_NUM_FILES_COUNT);
+        StopWatch sw(env_, stats_, STALL_L0_NUM_FILES_COUNT, &stall);
         if (!has_timeout) {
           bg_cv_.Wait();
         } else {
           bg_cv_.TimedWait(expiration_time);
         }
-        stall = sw.ElapsedMicros();
       }
-      RecordTick(options_.statistics.get(),
-                 STALL_L0_NUM_FILES_MICROS, stall);
-      cfd->internal_stats()->RecordWriteStall(InternalStats::LEVEL0_NUM_FILES,
-                                              stall);
+      RecordTick(stats_, STALL_L0_NUM_FILES_MICROS, stall);
+      cfd->internal_stats()->AddCFStats(
+          InternalStats::LEVEL0_NUM_FILES, stall);
     } else if (allow_hard_rate_limit_delay && cfd->ExceedsHardRateLimit()) {
       // Delay a write when the compaction score for any level is too large.
-      int max_level = cfd->current()->MaxCompactionScoreLevel();
+      const int max_level = cfd->current()->MaxCompactionScoreLevel();
       score = cfd->current()->MaxCompactionScore();
       mutex_.Unlock();
       uint64_t delayed;
       {
-        StopWatch sw(env_, options_.statistics.get(),
-                     HARD_RATE_LIMIT_DELAY_COUNT);
+        StopWatch sw(env_, stats_, HARD_RATE_LIMIT_DELAY_COUNT, &delayed);
         env_->SleepForMicroseconds(1000);
-        delayed = sw.ElapsedMicros();
       }
-      cfd->internal_stats()->RecordLevelNSlowdown(max_level, delayed);
       // Make sure the following value doesn't round to zero.
       uint64_t rate_limit = std::max((delayed / 1000), (uint64_t) 1);
       rate_limit_delay_millis += rate_limit;
-      RecordTick(options_.statistics.get(),
-                 RATE_LIMIT_DELAY_MILLIS, rate_limit);
+      RecordTick(stats_, RATE_LIMIT_DELAY_MILLIS, rate_limit);
       if (cfd->options()->rate_limit_delay_max_milliseconds > 0 &&
           rate_limit_delay_millis >=
               (unsigned)cfd->options()->rate_limit_delay_max_milliseconds) {
         allow_hard_rate_limit_delay = false;
       }
       mutex_.Lock();
+      cfd->internal_stats()->RecordLevelNSlowdown(max_level, delayed, false);
     } else if (allow_soft_rate_limit_delay && cfd->ExceedsSoftRateLimit()) {
+      const int max_level = cfd->current()->MaxCompactionScoreLevel();
       score = cfd->current()->MaxCompactionScore();
       // Delay a write when the compaction score for any level is too large.
       // TODO: add statistics
       uint64_t slowdown = SlowdownAmount(score, cfd->options()->soft_rate_limit,
                                          cfd->options()->hard_rate_limit);
+      uint64_t elapsed = 0;
       mutex_.Unlock();
       {
-        StopWatch sw(env_, options_.statistics.get(),
-                     SOFT_RATE_LIMIT_DELAY_COUNT);
+        StopWatch sw(env_, stats_, SOFT_RATE_LIMIT_DELAY_COUNT, &elapsed);
         env_->SleepForMicroseconds(slowdown);
-        slowdown = sw.ElapsedMicros();
         rate_limit_delay_millis += slowdown;
       }
       allow_soft_rate_limit_delay = false;
       mutex_.Lock();
+      cfd->internal_stats()->RecordLevelNSlowdown(max_level, elapsed, true);
     } else {
       unique_ptr<WritableFile> lfile;
       log::Writer* new_log = nullptr;
@@ -4360,8 +4369,16 @@ bool DBImpl::GetProperty(ColumnFamilyHandle* column_family,
   auto cfd = cfh->cfd();
   DBPropertyType property_type = GetPropertyType(property);
   MutexLock l(&mutex_);
-  return cfd->internal_stats()->GetProperty(property_type, property, value,
-                                            cfd);
+  return cfd->internal_stats()->GetProperty(property_type, property, value);
+}
+
+bool DBImpl::GetIntProperty(ColumnFamilyHandle* column_family,
+                            const Slice& property, uint64_t* value) {
+  auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
+  auto cfd = cfh->cfd();
+  DBPropertyType property_type = GetPropertyType(property);
+  MutexLock l(&mutex_);
+  return cfd->internal_stats()->GetIntProperty(property_type, property, value);
 }
 
 void DBImpl::GetApproximateSizes(ColumnFamilyHandle* column_family,
@@ -4403,7 +4420,7 @@ Status DBImpl::GetUpdatesSince(
     SequenceNumber seq, unique_ptr<TransactionLogIterator>* iter,
     const TransactionLogIterator::ReadOptions& read_options) {
 
-  RecordTick(options_.statistics.get(), GET_UPDATES_SINCE_CALLS);
+  RecordTick(stats_, GET_UPDATES_SINCE_CALLS);
   if (seq > versions_->LastSequence()) {
     return Status::NotFound("Requested sequence not yet written in the db");
   }
@@ -4625,8 +4642,18 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
                 const std::vector<ColumnFamilyDescriptor>& column_families,
                 std::vector<ColumnFamilyHandle*>* handles, DB** dbptr) {
   if (db_options.db_paths.size() > 1) {
-    return Status::NotSupported(
-        "More than one DB paths are not supported yet. ");
+    for (auto& cfd : column_families) {
+      if (cfd.options.compaction_style != kCompactionStyleUniversal) {
+        return Status::NotSupported(
+            "More than one DB paths are only supported in "
+            "universal compaction style. ");
+      }
+    }
+
+    if (db_options.db_paths.size() > 4) {
+      return Status::NotSupported(
+        "More than four DB paths are not supported yet. ");
+    }
   }
 
   *dbptr = nullptr;
@@ -4645,8 +4672,8 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
   DBImpl* impl = new DBImpl(db_options, dbname);
   Status s = impl->env_->CreateDirIfMissing(impl->options_.wal_dir);
   if (s.ok()) {
-    for (auto path : impl->options_.db_paths) {
-      s = impl->env_->CreateDirIfMissing(path);
+    for (auto db_path : impl->options_.db_paths) {
+      s = impl->env_->CreateDirIfMissing(db_path.path);
       if (!s.ok()) {
         break;
       }
@@ -4712,7 +4739,6 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
           DBImpl::LogFileNumberSize(impl->logfile_number_));
       impl->DeleteObsoleteFiles();
       impl->MaybeScheduleFlushOrCompaction();
-      impl->MaybeScheduleLogDBDeployStats();
       s = impl->db_directory_->Fsync();
     }
   }
@@ -4815,14 +4841,14 @@ Status DestroyDB(const std::string& dbname, const Options& options) {
       }
     }
 
-    for (auto db_path : options.db_paths) {
-      env->GetChildren(db_path, &filenames);
+    for (auto& db_path : options.db_paths) {
+      env->GetChildren(db_path.path, &filenames);
       uint64_t number;
       FileType type;
       for (size_t i = 0; i < filenames.size(); i++) {
         if (ParseFileName(filenames[i], &number, &type) &&
             type == kTableFile) {  // Lock file will be deleted at end
-          Status del = env->DeleteFile(db_path + "/" + filenames[i]);
+          Status del = env->DeleteFile(db_path.path + "/" + filenames[i]);
           if (result.ok() && !del.ok()) {
             result = del;
           }

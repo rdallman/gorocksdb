@@ -20,7 +20,6 @@
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "port/port.h"
-#include "util/stats_logger.h"
 
 namespace rocksdb {
 
@@ -43,11 +42,8 @@ class DBImplReadOnly : public DBImpl {
 
   virtual Status NewIterators(
       const ReadOptions& options,
-      const std::vector<ColumnFamilyHandle*>& column_family,
-      std::vector<Iterator*>* iterators) {
-   // TODO
-    return Status::NotSupported("Not supported yet.");
-  }
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      std::vector<Iterator*>* iterators);
 
   using DBImpl::Put;
   virtual Status Put(const WriteOptions& options,

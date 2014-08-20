@@ -25,6 +25,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
 #include "table/block_based_table_factory.h"
+#include "util/statistics.h"
 
 namespace rocksdb {
 
@@ -264,7 +265,6 @@ void DBOptions::Dump(Logger* log) const {
         (unsigned long)max_manifest_file_size);
     Log(log, "     Options.log_file_time_to_roll: %zu", log_file_time_to_roll);
     Log(log, "     Options.keep_log_file_num: %zu", keep_log_file_num);
-    Log(log, " Options.db_stats_log_interval: %d", db_stats_log_interval);
     Log(log, "       Options.allow_os_buffer: %d", allow_os_buffer);
     Log(log, "      Options.allow_mmap_reads: %d", allow_mmap_reads);
     Log(log, "     Options.allow_mmap_writes: %d", allow_mmap_writes);

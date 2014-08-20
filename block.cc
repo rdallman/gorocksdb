@@ -22,6 +22,7 @@
 #include "table/format.h"
 #include "util/coding.h"
 #include "util/logging.h"
+#include "db/dbformat.h"
 
 namespace rocksdb {
 
@@ -94,7 +95,7 @@ class Block::Iter : public Iterator {
   // current_ is offset in data_ of current entry.  >= restarts_ if !Valid
   uint32_t current_;
   uint32_t restart_index_;  // Index of restart block in which current_ falls
-  std::string key_;
+  IterKey key_;
   Slice value_;
   Status status_;
   BlockHashIndex* hash_index_;
@@ -115,7 +116,7 @@ class Block::Iter : public Iterator {
   }
 
   void SeekToRestartPoint(uint32_t index) {
-    key_.clear();
+    key_.Clear();
     restart_index_ = index;
     // current_ will be fixed by ParseNextKey();
 
@@ -143,7 +144,7 @@ class Block::Iter : public Iterator {
   virtual Status status() const { return status_; }
   virtual Slice key() const {
     assert(Valid());
-    return key_;
+    return key_.GetKey();
   }
   virtual Slice value() const {
     assert(Valid());
@@ -193,7 +194,7 @@ class Block::Iter : public Iterator {
     // Linear search (within restart block) for first key >= target
 
     while (true) {
-      if (!ParseNextKey() || Compare(key_, target) >= 0) {
+      if (!ParseNextKey() || Compare(key_.GetKey(), target) >= 0) {
         return;
       }
     }
@@ -215,7 +216,7 @@ class Block::Iter : public Iterator {
     current_ = restarts_;
     restart_index_ = num_restarts_;
     status_ = Status::Corruption("bad entry in block");
-    key_.clear();
+    key_.Clear();
     value_.clear();
   }
 
@@ -233,12 +234,11 @@ class Block::Iter : public Iterator {
     // Decode next entry
     uint32_t shared, non_shared, value_length;
     p = DecodeEntry(p, limit, &shared, &non_shared, &value_length);
-    if (p == nullptr || key_.size() < shared) {
+    if (p == nullptr || key_.Size() < shared) {
       CorruptionError();
       return false;
     } else {
-      key_.resize(shared);
-      key_.append(p, non_shared);
+      key_.TrimAppend(shared, p, non_shared);
       value_ = Slice(p + non_shared, value_length);
       while (restart_index_ + 1 < num_restarts_ &&
              GetRestartPoint(restart_index_ + 1) < current_) {
@@ -284,26 +284,36 @@ class Block::Iter : public Iterator {
     return true;
   }
 
+  // Compare target key and the block key of the block of `block_index`.
+  // Return -1 if error.
+  int CompareBlockKey(uint32_t block_index, const Slice& target) {
+    uint32_t region_offset = GetRestartPoint(block_index);
+    uint32_t shared, non_shared, value_length;
+    const char* key_ptr = DecodeEntry(data_ + region_offset, data_ + restarts_,
+                                      &shared, &non_shared, &value_length);
+    if (key_ptr == nullptr || (shared != 0)) {
+      CorruptionError();
+      return 1;  // Return target is smaller
+    }
+    Slice block_key(key_ptr, non_shared);
+    return Compare(block_key, target);
+  }
+
   // Binary search in block_ids to find the first block
   // with a key >= target
   bool BinaryBlockIndexSeek(const Slice& target, uint32_t* block_ids,
                             uint32_t left, uint32_t right,
                             uint32_t* index) {
     assert(left <= right);
+    uint32_t left_bound = left;
 
     while (left <= right) {
       uint32_t mid = (left + right) / 2;
-      uint32_t region_offset = GetRestartPoint(block_ids[mid]);
-      uint32_t shared, non_shared, value_length;
-      const char* key_ptr =
-          DecodeEntry(data_ + region_offset, data_ + restarts_, &shared,
-                      &non_shared, &value_length);
-      if (key_ptr == nullptr || (shared != 0)) {
-        CorruptionError();
+
+      int cmp = CompareBlockKey(block_ids[mid], target);
+      if (!status_.ok()) {
         return false;
       }
-      Slice mid_key(key_ptr, non_shared);
-      int cmp = Compare(mid_key, target);
       if (cmp < 0) {
         // Key at "target" is larger than "mid". Therefore all
         // blocks before or at "mid" are uninteresting.
@@ -318,6 +328,19 @@ class Block::Iter : public Iterator {
     }
 
     if (left == right) {
+      // In one of the two following cases:
+      // (1) left is the first one of block_ids
+      // (2) there is a gap of blocks between block of `left` and `left-1`.
+      // we can further distinguish the case of key in the block or key not
+      // existing, by comparing the target key and the key of the previous
+      // block to the left of the block found.
+      if (block_ids[left] > 0 &&
+          (left == left_bound || block_ids[left - 1] != block_ids[left] - 1) &&
+          CompareBlockKey(block_ids[left] - 1, target) > 0) {
+        current_ = restarts_;
+        return false;
+      }
+
       *index = block_ids[left];
       return true;
     } else {

@@ -20,7 +20,7 @@ fi
 rocksdir=$1 # root of rocksdb, relative or abs
 
 # get all newer .cc files we need from lib
-for f in *.cc; do newer=$(ag -g "$f" $rocksdir) && 
+for f in *.cc; do newer=$(ag -g "$f" $rocksdir);
   if [[ -n $newer ]]; 
     then mv "$newer $f";
   fi;
