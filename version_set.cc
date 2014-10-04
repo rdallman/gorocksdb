@@ -301,23 +301,6 @@ class FilePicker {
 };
 }  // anonymous namespace
 
-static uint64_t TotalFileSize(const std::vector<FileMetaData*>& files) {
-  uint64_t sum = 0;
-  for (size_t i = 0; i < files.size() && files[i]; i++) {
-    sum += files[i]->fd.GetFileSize();
-  }
-  return sum;
-}
-
-static uint64_t TotalCompensatedFileSize(
-    const std::vector<FileMetaData*>& files) {
-  uint64_t sum = 0;
-  for (size_t i = 0; i < files.size() && files[i]; i++) {
-    sum += files[i]->compensated_file_size;
-  }
-  return sum;
-}
-
 Version::~Version() {
   assert(refs_ == 0);
 
@@ -593,6 +576,18 @@ Status Version::GetPropertiesOfAllTables(TablePropertiesCollection* props) {
   return Status::OK();
 }
 
+size_t Version::GetMemoryUsageByTableReaders() {
+  size_t total_usage = 0;
+  for (auto& file_level : file_levels_) {
+    for (size_t i = 0; i < file_level.num_files; i++) {
+      total_usage += cfd_->table_cache()->GetMemoryUsageByTableReader(
+          vset_->storage_options_, cfd_->internal_comparator(),
+          file_level.files[i].fd);
+    }
+  }
+  return total_usage;
+}
+
 uint64_t Version::GetEstimatedActiveKeys() {
   // Estimation will be not accurate when:
   // (1) there is merge keys
@@ -654,7 +649,6 @@ void Version::AddIterators(const ReadOptions& read_options,
 }
 
 // Callback from TableCache::Get()
-namespace {
 enum SaverState {
   kNotFound,
   kFound,
@@ -662,6 +656,8 @@ enum SaverState {
   kCorrupt,
   kMerge // saver contains the current merge result (the operands)
 };
+
+namespace version_set {
 struct Saver {
   SaverState state;
   const Comparator* ucmp;
@@ -674,7 +670,7 @@ struct Saver {
   Logger* logger;
   Statistics* statistics;
 };
-}
+} // namespace version_set
 
 // Called from TableCache::Get and Table::Get when file/block in which
 // key may  exist are not there in TableCache/BlockCache respectively. In this
@@ -682,7 +678,7 @@ struct Saver {
 // IO to be  certain.Set the status=kFound and value_found=false to let the
 // caller know that key may exist but is not there in memory
 static void MarkKeyMayExist(void* arg) {
-  Saver* s = reinterpret_cast<Saver*>(arg);
+  version_set::Saver* s = reinterpret_cast<version_set::Saver*>(arg);
   s->state = kFound;
   if (s->value_found != nullptr) {
     *(s->value_found) = false;
@@ -691,7 +687,7 @@ static void MarkKeyMayExist(void* arg) {
 
 static bool SaveValue(void* arg, const ParsedInternalKey& parsed_key,
                       const Slice& v) {
-  Saver* s = reinterpret_cast<Saver*>(arg);
+  version_set::Saver* s = reinterpret_cast<version_set::Saver*>(arg);
   MergeContext* merge_contex = s->merge_context;
   std::string merge_result;  // temporary area for merge results later
 
@@ -805,7 +801,7 @@ void Version::Get(const ReadOptions& options,
   Slice user_key = k.user_key();
 
   assert(status->ok() || status->IsMergeInProgress());
-  Saver saver;
+  version_set::Saver saver;
   saver.state = status->ok()? kNotFound : kMerge;
   saver.ucmp = user_comparator_;
   saver.user_key = user_key;
@@ -845,6 +841,11 @@ void Version::Get(const ReadOptions& options,
   }
 
   if (kMerge == saver.state) {
+    if (!merge_operator_) {
+      *status =  Status::InvalidArgument(
+          "merge_operator is not properly initialized.");
+      return;
+    }
     // merge_operands are in saver and we hit the beginning of the key history
     // do a final merge of nullptr and operands;
     if (merge_operator_->FullMerge(user_key, nullptr,
@@ -878,12 +879,16 @@ void Version::PrepareApply(std::vector<uint64_t>& size_being_compacted) {
 }
 
 bool Version::MaybeInitializeFileMetaData(FileMetaData* file_meta) {
-  if (file_meta->num_entries > 0) {
+  if (file_meta->init_stats_from_file) {
     return false;
   }
   std::shared_ptr<const TableProperties> tp;
   Status s = GetTableProperties(&tp, file_meta);
+  file_meta->init_stats_from_file = true;
   if (!s.ok()) {
+    Log(vset_->options_->info_log,
+        "Unable to load table properties for file %" PRIu64 " --- %s\n",
+        file_meta->fd.GetNumber(), s.ToString().c_str());
     return false;
   }
   if (tp.get() == nullptr) return false;
@@ -1392,7 +1397,7 @@ const char* Version::LevelFileSummary(FileSummaryStorage* scratch,
   for (const auto& f : files_[level]) {
     int sz = sizeof(scratch->buffer) - len;
     char sztxt[16];
-    AppendHumanBytes(f->fd.GetFileSize(), sztxt, 16);
+    AppendHumanBytes(f->fd.GetFileSize(), sztxt, sizeof(sztxt));
     int ret = snprintf(scratch->buffer + len, sz,
                        "#%" PRIu64 "(seq=%" PRIu64 ",sz=%s,%d) ",
                        f->fd.GetNumber(), f->smallest_seqno, sztxt,
@@ -1876,6 +1881,9 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
     // This is fine because everything inside of this block is serialized --
     // only one thread can be here at the same time
     if (new_descriptor_log) {
+      // create manifest file
+      Log(options_->info_log,
+          "Creating manifest %" PRIu64 "\n", pending_manifest_file_number_);
       unique_ptr<WritableFile> descriptor_file;
       s = env_->NewWritableFile(
           DescriptorFileName(dbname_, pending_manifest_file_number_),
@@ -1997,6 +2005,9 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
         column_family_data->GetName().c_str());
     delete v;
     if (new_descriptor_log) {
+      Log(options_->info_log,
+        "Deleting manifest %" PRIu64 " current manifest %" PRIu64 "\n",
+        manifest_file_number_, pending_manifest_file_number_);
       descriptor_log_.reset();
       env_->DeleteFile(
           DescriptorFileName(dbname_, pending_manifest_file_number_));

@@ -36,6 +36,9 @@ using rocksdb::ColumnFamilyHandle;
 using rocksdb::ColumnFamilyOptions;
 using rocksdb::CompactionFilter;
 using rocksdb::CompactionFilterFactory;
+using rocksdb::CompactionFilterV2;
+using rocksdb::CompactionFilterFactoryV2;
+using rocksdb::CompactionFilterContext;
 using rocksdb::CompactionOptionsFIFO;
 using rocksdb::Comparator;
 using rocksdb::CompressionType;
@@ -52,6 +55,7 @@ using rocksdb::MergeOperator;
 using rocksdb::NewBloomFilterPolicy;
 using rocksdb::NewLRUCache;
 using rocksdb::Options;
+using rocksdb::BlockBasedTableOptions;
 using rocksdb::RandomAccessFile;
 using rocksdb::Range;
 using rocksdb::ReadOptions;
@@ -78,6 +82,7 @@ struct rocksdb_fifo_compaction_options_t { CompactionOptionsFIFO rep; };
 struct rocksdb_readoptions_t     { ReadOptions       rep; };
 struct rocksdb_writeoptions_t    { WriteOptions      rep; };
 struct rocksdb_options_t         { Options           rep; };
+struct rocksdb_block_based_table_options_t  { BlockBasedTableOptions rep; };
 struct rocksdb_seqfile_t         { SequentialFile*   rep; };
 struct rocksdb_randomfile_t      { RandomAccessFile* rep; };
 struct rocksdb_writablefile_t    { WritableFile*     rep; };
@@ -152,6 +157,104 @@ struct rocksdb_compactionfilterfactory_t : public CompactionFilterFactory {
   }
 
   virtual const char* Name() const { return (*name_)(state_); }
+};
+
+struct rocksdb_compactionfilterv2_t : public CompactionFilterV2 {
+  void* state_;
+  void (*destructor_)(void*);
+  const char* (*name_)(void*);
+  void (*filter_)(void*, int level, size_t num_keys,
+                  const char* const* keys_list, const size_t* keys_list_sizes,
+                  const char* const* existing_values_list, const size_t* existing_values_list_sizes,
+                  char** new_values_list, size_t* new_values_list_sizes,
+                  unsigned char* to_delete_list);
+
+  virtual ~rocksdb_compactionfilterv2_t() {
+    (*destructor_)(state_);
+  }
+
+  virtual const char* Name() const {
+    return (*name_)(state_);
+  }
+
+  virtual std::vector<bool> Filter(int level,
+                                   const SliceVector& keys,
+                                   const SliceVector& existing_values,
+                                   std::vector<std::string>* new_values,
+                                   std::vector<bool>* values_changed) const {
+    // Make a vector pointing to the underlying key data.
+    size_t num_keys = keys.size();
+    std::vector<const char*> keys_list(num_keys);
+    std::vector<size_t> keys_list_sizes(num_keys);
+    for (size_t i = 0; i < num_keys; ++i) {
+      keys_list[i] = keys[i].data();
+      keys_list_sizes[i] = keys[i].size();
+    }
+    // Make a vector pointing to the underlying value data.
+    std::vector<const char*> existing_values_list(num_keys);
+    std::vector<size_t> existing_values_list_sizes(num_keys);
+    for (size_t i = 0; i < num_keys; ++i) {
+      existing_values_list[i] = existing_values[i].data();
+      existing_values_list_sizes[i] = existing_values[i].size();
+    }
+    // Make a vector which will accept newly-allocated char* arrays
+    // which we will take ownership of and assign to strings in new_values.
+    new_values->clear();
+    std::vector<char*> new_values_list(num_keys);
+    std::vector<size_t> new_values_list_sizes(num_keys);
+    // Resize values_changed to hold all keys.
+    values_changed->resize(num_keys);
+    // Make a vector for bools indicating a value should be deleted
+    // on compaction (true) or maintained (false).
+    std::vector<unsigned char> to_delete_list(num_keys);
+
+    (*filter_)(
+        state_, level, num_keys, &keys_list[0], &keys_list_sizes[0],
+        &existing_values_list[0], &existing_values_list_sizes[0],
+        &new_values_list[0], &new_values_list_sizes[0], &to_delete_list[0]);
+
+    // Now, we transfer any changed values, setting values_changed and
+    // initializing new_values in the event a value changed.
+    std::vector<bool> to_delete(num_keys);
+    for (size_t i = 0; i < num_keys; ++i) {
+      to_delete[i] = to_delete_list[i];
+      (*values_changed)[i] = new_values_list[i] != nullptr;
+      if ((*values_changed)[i]) {
+        new_values->push_back(std::string(new_values_list[i], new_values_list_sizes[i]));
+        free(new_values_list[i]);
+      }
+    }
+    return to_delete;
+  }
+};
+
+struct rocksdb_compactionfilterfactoryv2_t : public CompactionFilterFactoryV2 {
+  void* state_;
+  void (*destructor_)(void*);
+  const char* (*name_)(void*);
+  rocksdb_compactionfilterv2_t* (*create_compaction_filter_v2_)(
+      void* state, const rocksdb_compactionfiltercontext_t* context);
+
+  rocksdb_compactionfilterfactoryv2_t(const SliceTransform* prefix_extractor)
+      : CompactionFilterFactoryV2(prefix_extractor) {
+  }
+
+  virtual ~rocksdb_compactionfilterfactoryv2_t() {
+    (*destructor_)(state_);
+  }
+
+  virtual const char* Name() const {
+    return (*name_)(state_);
+  }
+
+  virtual std::unique_ptr<CompactionFilterV2> CreateCompactionFilterV2(
+      const CompactionFilterContext& context) {
+    struct rocksdb_compactionfiltercontext_t c_context;
+    c_context.rep.is_full_compaction = context.is_full_compaction;
+    c_context.rep.is_manual_compaction = context.is_manual_compaction;
+    return std::unique_ptr<CompactionFilterV2>(
+        (*create_compaction_filter_v2_)(state_, &c_context));
+  }
 };
 
 struct rocksdb_comparator_t : public Comparator {
@@ -952,6 +1055,74 @@ const char* rocksdb_writebatch_data(rocksdb_writebatch_t* b, size_t* size) {
   return b->rep.Data().c_str();
 }
 
+rocksdb_block_based_table_options_t*
+rocksdb_block_based_options_create() {
+  return new rocksdb_block_based_table_options_t;
+}
+
+void rocksdb_block_based_options_destroy(
+    rocksdb_block_based_table_options_t* options) {
+  delete options;
+}
+
+void rocksdb_block_based_options_set_block_size(
+    rocksdb_block_based_table_options_t* options, size_t block_size) {
+  options->rep.block_size = block_size;
+}
+
+void rocksdb_block_based_options_set_block_size_deviation(
+    rocksdb_block_based_table_options_t* options, int block_size_deviation) {
+  options->rep.block_size_deviation = block_size_deviation;
+}
+
+void rocksdb_block_based_options_set_block_restart_interval(
+    rocksdb_block_based_table_options_t* options, int block_restart_interval) {
+  options->rep.block_restart_interval = block_restart_interval;
+}
+
+void rocksdb_block_based_options_set_filter_policy(
+    rocksdb_block_based_table_options_t* options,
+    rocksdb_filterpolicy_t* filter_policy) {
+  options->rep.filter_policy.reset(filter_policy);
+}
+
+void rocksdb_block_based_options_set_no_block_cache(
+    rocksdb_block_based_table_options_t* options,
+    unsigned char no_block_cache) {
+  options->rep.no_block_cache = no_block_cache;
+}
+
+void rocksdb_block_based_options_set_block_cache(
+    rocksdb_block_based_table_options_t* options,
+    rocksdb_cache_t* block_cache) {
+  if (block_cache) {
+    options->rep.block_cache = block_cache->rep;
+  }
+}
+
+void rocksdb_block_based_options_set_block_cache_compressed(
+    rocksdb_block_based_table_options_t* options,
+    rocksdb_cache_t* block_cache_compressed) {
+  if (block_cache_compressed) {
+    options->rep.block_cache_compressed = block_cache_compressed->rep;
+  }
+}
+
+void rocksdb_block_based_options_set_whole_key_filtering(
+    rocksdb_block_based_table_options_t* options, unsigned char v) {
+  options->rep.whole_key_filtering = v;
+}
+
+void rocksdb_options_set_block_based_table_factory(
+    rocksdb_options_t *opt,
+    rocksdb_block_based_table_options_t* table_options) {
+  if (table_options) {
+    opt->rep.table_factory.reset(
+        rocksdb::NewBlockBasedTableFactory(table_options->rep));
+  }
+}
+
+
 rocksdb_options_t* rocksdb_options_create() {
   return new rocksdb_options_t;
 }
@@ -966,8 +1137,8 @@ void rocksdb_options_increase_parallelism(
 }
 
 void rocksdb_options_optimize_for_point_lookup(
-    rocksdb_options_t* opt) {
-  opt->rep.OptimizeForPointLookup();
+    rocksdb_options_t* opt, uint64_t block_cache_size_mb) {
+  opt->rep.OptimizeForPointLookup(block_cache_size_mb);
 }
 
 void rocksdb_options_optimize_level_style_compaction(
@@ -1004,10 +1175,10 @@ void rocksdb_options_set_merge_operator(
   opt->rep.merge_operator = std::shared_ptr<MergeOperator>(merge_operator);
 }
 
-void rocksdb_options_set_filter_policy(
+void rocksdb_options_set_compaction_filter_factory_v2(
     rocksdb_options_t* opt,
-    rocksdb_filterpolicy_t* policy) {
-  opt->rep.filter_policy = policy;
+    rocksdb_compactionfilterfactoryv2_t* compaction_filter_factory_v2) {
+  opt->rep.compaction_filter_factory_v2 = std::shared_ptr<CompactionFilterFactoryV2>(compaction_filter_factory_v2);
 }
 
 void rocksdb_options_set_create_if_missing(
@@ -1051,26 +1222,6 @@ void rocksdb_options_set_write_buffer_size(rocksdb_options_t* opt, size_t s) {
 
 void rocksdb_options_set_max_open_files(rocksdb_options_t* opt, int n) {
   opt->rep.max_open_files = n;
-}
-
-void rocksdb_options_set_cache(rocksdb_options_t* opt, rocksdb_cache_t* c) {
-  if (c) {
-    opt->rep.block_cache = c->rep;
-  }
-}
-
-void rocksdb_options_set_cache_compressed(rocksdb_options_t* opt, rocksdb_cache_t* c) {
-  if (c) {
-    opt->rep.block_cache_compressed = c->rep;
-  }
-}
-
-void rocksdb_options_set_block_size(rocksdb_options_t* opt, size_t s) {
-  opt->rep.block_size = s;
-}
-
-void rocksdb_options_set_block_restart_interval(rocksdb_options_t* opt, int n) {
-  opt->rep.block_restart_interval = n;
 }
 
 void rocksdb_options_set_target_file_size_base(
@@ -1165,11 +1316,6 @@ void rocksdb_options_set_prefix_extractor(
   opt->rep.prefix_extractor.reset(prefix_extractor);
 }
 
-void rocksdb_options_set_whole_key_filtering(
-    rocksdb_options_t* opt, unsigned char v) {
-  opt->rep.whole_key_filtering = v;
-}
-
 void rocksdb_options_set_disable_data_sync(
     rocksdb_options_t* opt, int disable_data_sync) {
   opt->rep.disableDataSync = disable_data_sync;
@@ -1178,11 +1324,6 @@ void rocksdb_options_set_disable_data_sync(
 void rocksdb_options_set_use_fsync(
     rocksdb_options_t* opt, int use_fsync) {
   opt->rep.use_fsync = use_fsync;
-}
-
-void rocksdb_options_set_db_stats_log_interval(
-    rocksdb_options_t* opt, int db_stats_log_interval) {
-  opt->rep.db_stats_log_interval = db_stats_log_interval;
 }
 
 void rocksdb_options_set_db_log_dir(
@@ -1242,11 +1383,6 @@ void rocksdb_options_set_skip_log_error_on_recovery(
 void rocksdb_options_set_stats_dump_period_sec(
     rocksdb_options_t* opt, unsigned int v) {
   opt->rep.stats_dump_period_sec = v;
-}
-
-void rocksdb_options_set_block_size_deviation(
-    rocksdb_options_t* opt, int v) {
-  opt->rep.block_size_deviation = v;
 }
 
 void rocksdb_options_set_advise_random_on_open(
@@ -1343,11 +1479,6 @@ void rocksdb_options_set_max_manifest_file_size(
   opt->rep.max_manifest_file_size = v;
 }
 
-void rocksdb_options_set_no_block_cache(
-    rocksdb_options_t* opt, unsigned char v) {
-  opt->rep.no_block_cache = v;
-}
-
 void rocksdb_options_set_table_cache_numshardbits(
     rocksdb_options_t* opt, int v) {
   opt->rep.table_cache_numshardbits = v;
@@ -1365,10 +1496,6 @@ void rocksdb_options_set_arena_block_size(
 
 void rocksdb_options_set_disable_auto_compactions(rocksdb_options_t* opt, int disable) {
   opt->rep.disable_auto_compactions = disable;
-}
-
-void rocksdb_options_set_disable_seek_compaction(rocksdb_options_t* opt, int disable) {
-  opt->rep.disable_seek_compaction = disable;
 }
 
 void rocksdb_options_set_delete_obsolete_files_period_micros(
@@ -1547,6 +1674,46 @@ rocksdb_compactionfilterfactory_t* rocksdb_compactionfilterfactory_create(
 
 void rocksdb_compactionfilterfactory_destroy(
     rocksdb_compactionfilterfactory_t* factory) {
+  delete factory;
+}
+
+rocksdb_compactionfilterv2_t* rocksdb_compactionfilterv2_create(
+    void* state,
+    void (*destructor)(void*),
+    void (*filter)(void*, int level, size_t num_keys,
+                   const char* const* keys_list, const size_t* keys_list_sizes,
+                   const char* const* existing_values_list, const size_t* existing_values_list_sizes,
+                   char** new_values_list, size_t* new_values_list_sizes,
+                   unsigned char* to_delete_list),
+    const char* (*name)(void*)) {
+  rocksdb_compactionfilterv2_t* result = new rocksdb_compactionfilterv2_t;
+  result->state_ = state;
+  result->destructor_ = destructor;
+  result->filter_ = filter;
+  result->name_ = name;
+  return result;
+}
+
+void rocksdb_compactionfilterv2_destroy(rocksdb_compactionfilterv2_t* filter) {
+  delete filter;
+}
+
+rocksdb_compactionfilterfactoryv2_t* rocksdb_compactionfilterfactoryv2_create(
+    void* state,
+    rocksdb_slicetransform_t* prefix_extractor,
+    void (*destructor)(void*),
+    rocksdb_compactionfilterv2_t* (*create_compaction_filter_v2)(
+        void* state, const rocksdb_compactionfiltercontext_t* context),
+    const char* (*name)(void*)) {
+  rocksdb_compactionfilterfactoryv2_t* result = new rocksdb_compactionfilterfactoryv2_t(prefix_extractor);
+  result->state_ = state;
+  result->destructor_ = destructor;
+  result->create_compaction_filter_v2_ = create_compaction_filter_v2;
+  result->name_ = name;
+  return result;
+}
+
+void rocksdb_compactionfilterfactoryv2_destroy(rocksdb_compactionfilterfactoryv2_t* factory) {
   delete factory;
 }
 

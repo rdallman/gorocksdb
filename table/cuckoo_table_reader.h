@@ -11,6 +11,8 @@
 #ifndef ROCKSDB_LITE
 #include <string>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "db/dbformat.h"
 #include "rocksdb/env.h"
@@ -27,10 +29,11 @@ class CuckooTableReader: public TableReader {
       const Options& options,
       std::unique_ptr<RandomAccessFile>&& file,
       uint64_t file_size,
-      uint64_t (*GetSliceHash)(const Slice&, uint32_t, uint64_t));
+      const Comparator* user_comparator,
+      uint64_t (*get_slice_hash)(const Slice&, uint32_t, uint64_t));
   ~CuckooTableReader() {}
 
-  std::shared_ptr<const TableProperties> GetTableProperties() const {
+  std::shared_ptr<const TableProperties> GetTableProperties() const override {
     return table_props_;
   }
 
@@ -40,30 +43,38 @@ class CuckooTableReader: public TableReader {
       const ReadOptions& readOptions, const Slice& key, void* handle_context,
       bool (*result_handler)(void* arg, const ParsedInternalKey& k,
                              const Slice& v),
-      void (*mark_key_may_exist_handler)(void* handle_context) = nullptr);
+      void (*mark_key_may_exist_handler)(void* handle_context) = nullptr)
+    override;
 
-  Iterator* NewIterator(const ReadOptions&, Arena* arena = nullptr);
+  Iterator* NewIterator(const ReadOptions&, Arena* arena = nullptr) override;
+  void Prepare(const Slice& target) override;
+
+  // Report an approximation of how much memory has been used.
+  size_t ApproximateMemoryUsage() const override;
 
   // Following methods are not implemented for Cuckoo Table Reader
-  uint64_t ApproximateOffsetOf(const Slice& key) { return 0; }
-  void SetupForCompaction() {}
-  void Prepare(const Slice& target) {}
+  uint64_t ApproximateOffsetOf(const Slice& key) override { return 0; }
+  void SetupForCompaction() override {}
   // End of methods not implemented.
 
  private:
+  friend class CuckooTableIterator;
+  void LoadAllKeys(std::vector<std::pair<Slice, uint32_t>>* key_to_bucket_id);
   std::unique_ptr<RandomAccessFile> file_;
   Slice file_data_;
-  const uint64_t file_size_;
   bool is_last_level_;
   std::shared_ptr<const TableProperties> table_props_;
   Status status_;
-  uint32_t num_hash_fun_;
+  uint32_t num_hash_func_;
   std::string unused_key_;
   uint32_t key_length_;
   uint32_t value_length_;
   uint32_t bucket_length_;
-  uint64_t num_buckets_;
-  uint64_t (*GetSliceHash)(const Slice& s, uint32_t index,
+  uint32_t cuckoo_block_size_;
+  uint32_t cuckoo_block_bytes_minus_one_;
+  uint64_t table_size_minus_one_;
+  const Comparator* ucomp_;
+  uint64_t (*get_slice_hash_)(const Slice& s, uint32_t index,
       uint64_t max_num_buckets);
 };
 

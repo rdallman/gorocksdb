@@ -174,13 +174,13 @@ const char* EncodeKey(std::string* scratch, const Slice& target) {
 
 class MemTableIterator: public Iterator {
  public:
-  MemTableIterator(const MemTable& mem, const ReadOptions& options,
-                   bool enforce_total_order, Arena* arena)
+  MemTableIterator(
+      const MemTable& mem, const ReadOptions& options, Arena* arena)
       : bloom_(nullptr),
         prefix_extractor_(mem.prefix_extractor_),
         valid_(false),
         arena_mode_(arena != nullptr) {
-    if (prefix_extractor_ != nullptr && !enforce_total_order) {
+    if (prefix_extractor_ != nullptr && !options.total_order_seek) {
       bloom_ = mem.prefix_bloom_.get();
       iter_ = mem.table_->GetDynamicPrefixIterator(arena);
     } else {
@@ -248,14 +248,13 @@ class MemTableIterator: public Iterator {
   void operator=(const MemTableIterator&);
 };
 
-Iterator* MemTable::NewIterator(const ReadOptions& options,
-                                bool enforce_total_order, Arena* arena) {
+Iterator* MemTable::NewIterator(const ReadOptions& options, Arena* arena) {
   if (arena == nullptr) {
-    return new MemTableIterator(*this, options, enforce_total_order, nullptr);
+    return new MemTableIterator(*this, options, nullptr);
   } else {
     auto mem = arena->AllocateAligned(sizeof(MemTableIterator));
     return new (mem)
-        MemTableIterator(*this, options, enforce_total_order, arena);
+        MemTableIterator(*this, options, arena);
   }
 }
 
@@ -390,6 +389,16 @@ static bool SaveValue(void* arg, const char* entry) {
         return false;
       }
       case kTypeMerge: {
+        if (!merge_operator) {
+          *(s->status) = Status::InvalidArgument(
+              "merge_operator is not properly initialized.");
+          // Normally we continue the loop (return true) when we see a merge
+          // operand.  But in case of an error, we should stop the loop
+          // immediately and pretend we have found the value to stop further
+          // seek.  Otherwise, the later call will override this error status.
+          *(s->found_final_value) = true;
+          return false;
+        }
         std::string merge_result;  // temporary area for merge results later
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
         *(s->merge_in_progress) = true;
@@ -408,7 +417,12 @@ static bool SaveValue(void* arg, const char* entry) {
 
 bool MemTable::Get(const LookupKey& key, std::string* value, Status* s,
                    MergeContext& merge_context, const Options& options) {
-  PERF_TIMER_AUTO(get_from_memtable_time);
+  // The sequence number is updated synchronously in version_set.h
+  if (first_seqno_ == 0) {
+    // Avoiding recording stats for speed.
+    return false;
+  }
+  PERF_TIMER_GUARD(get_from_memtable_time);
 
   Slice user_key = key.user_key();
   bool found_final_value = false;
@@ -438,7 +452,6 @@ bool MemTable::Get(const LookupKey& key, std::string* value, Status* s,
   if (!found_final_value && merge_in_progress) {
     *s = Status::MergeInProgress("");
   }
-  PERF_TIMER_STOP(get_from_memtable_time);
   PERF_COUNTER_ADD(get_from_memtable_count, 1);
   return found_final_value;
 }

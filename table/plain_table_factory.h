@@ -164,7 +164,18 @@ class PlainTableFactory : public TableFactory {
                                 CompressionType compression_type) const
       override;
 
+  std::string GetPrintableTableOptions() const override;
+
   static const char kValueTypeSeqId0 = 0xFF;
+
+  // Sanitizes the specified DB Options.
+  Status SanitizeDBOptions(const DBOptions* db_opts) const override {
+    if (db_opts->allow_mmap_reads == false) {
+      return Status::NotSupported(
+          "PlainTable with allow_mmap_reads == false is not supported.");
+    }
+    return Status::OK();
+  }
 
  private:
   uint32_t user_key_len_;

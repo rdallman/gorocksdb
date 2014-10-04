@@ -22,10 +22,11 @@ static const size_t kFilterBaseLg = 11;
 static const size_t kFilterBase = 1 << kFilterBaseLg;
 
 FilterBlockBuilder::FilterBlockBuilder(const Options& opt,
+                                       const BlockBasedTableOptions& table_opt,
                                        const Comparator* internal_comparator)
-    : policy_(opt.filter_policy),
+    : policy_(table_opt.filter_policy.get()),
       prefix_extractor_(opt.prefix_extractor.get()),
-      whole_key_filtering_(opt.whole_key_filtering),
+      whole_key_filtering_(table_opt.whole_key_filtering),
       comparator_(internal_comparator) {}
 
 void FilterBlockBuilder::StartBlock(uint64_t block_offset) {
@@ -70,20 +71,14 @@ void FilterBlockBuilder::AddKey(const Slice& key) {
   }
 
   // add prefix to filter if needed
-  if (prefix_extractor_ && prefix_extractor_->InDomain(ExtractUserKey(key))) {
-    // If prefix_extractor_, this filter_block layer assumes we only
-    // operate on internal keys.
-    Slice user_key = ExtractUserKey(key);
+  if (prefix_extractor_ && prefix_extractor_->InDomain(key)) {
     // this assumes prefix(prefix(key)) == prefix(key), as the last
     // entry in entries_ may be either a key or prefix, and we use
     // prefix(last entry) to get the prefix of the last key.
-    if (prev.size() == 0 ||
-        !SamePrefix(user_key, ExtractUserKey(prev))) {
-      Slice prefix = prefix_extractor_->Transform(user_key);
-      InternalKey internal_prefix_tmp(prefix, 0, kTypeValue);
-      Slice internal_prefix = internal_prefix_tmp.Encode();
+    if (prev.size() == 0 || !SamePrefix(key, prev)) {
+      Slice prefix = prefix_extractor_->Transform(key);
       start_.push_back(entries_.size());
-      entries_.append(internal_prefix.data(), internal_prefix.size());
+      entries_.append(prefix.data(), prefix.size());
     }
   }
 }
@@ -131,10 +126,11 @@ void FilterBlockBuilder::GenerateFilter() {
 }
 
 FilterBlockReader::FilterBlockReader(
-    const Options& opt, const Slice& contents, bool delete_contents_after_use)
-    : policy_(opt.filter_policy),
+    const Options& opt, const BlockBasedTableOptions& table_opt,
+    const Slice& contents, bool delete_contents_after_use)
+    : policy_(table_opt.filter_policy.get()),
       prefix_extractor_(opt.prefix_extractor.get()),
-      whole_key_filtering_(opt.whole_key_filtering),
+      whole_key_filtering_(table_opt.whole_key_filtering),
       data_(nullptr),
       offset_(nullptr),
       num_(0),
@@ -184,4 +180,7 @@ bool FilterBlockReader::MayMatch(uint64_t block_offset, const Slice& entry) {
   return true;  // Errors are treated as potential matches
 }
 
+size_t FilterBlockReader::ApproximateMemoryUsage() const {
+  return num_ * 4 + 5 + (offset_ - data_);
+}
 }

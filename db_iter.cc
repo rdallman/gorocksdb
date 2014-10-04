@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <deque>
 #include <string>
+#include <limits>
 
 #include "db/filename.h"
 #include "db/dbformat.h"
@@ -71,6 +72,7 @@ class DBIter: public Iterator {
         current_entry_is_merged_(false),
         statistics_(options.statistics.get()) {
     RecordTick(statistics_, NO_ITERATORS);
+    has_prefix_extractor_ = (options.prefix_extractor.get() != nullptr);
     max_skip_ = options.max_sequential_skip_in_iterations;
   }
   virtual ~DBIter() {
@@ -130,6 +132,7 @@ class DBIter: public Iterator {
     }
   }
 
+  bool has_prefix_extractor_;
   bool arena_mode_;
   Env* const env_;
   Logger* logger_;
@@ -191,9 +194,8 @@ void DBIter::Next() {
 // NOTE: In between, saved_key_ can point to a user key that has
 //       a delete marker
 inline void DBIter::FindNextUserEntry(bool skipping) {
-  PERF_TIMER_AUTO(find_next_user_entry_time);
+  PERF_TIMER_GUARD(find_next_user_entry_time);
   FindNextUserEntryInternal(skipping);
-  PERF_TIMER_STOP(find_next_user_entry_time);
 }
 
 // Actual implementation of DBIter::FindNextUserEntry()
@@ -549,12 +551,17 @@ void DBIter::FindParseableKey(ParsedInternalKey* ikey, Direction direction) {
 }
 
 void DBIter::Seek(const Slice& target) {
+  StopWatch sw(env_, statistics_, DB_SEEK);
+
   saved_key_.Clear();
   // now savved_key is used to store internal key.
   saved_key_.SetInternalKey(target, sequence_);
-  PERF_TIMER_AUTO(seek_internal_seek_time);
-  iter_->Seek(saved_key_.GetKey());
-  PERF_TIMER_STOP(seek_internal_seek_time);
+
+  {
+    PERF_TIMER_GUARD(seek_internal_seek_time);
+    iter_->Seek(saved_key_.GetKey());
+  }
+
   if (iter_->Valid()) {
     direction_ = kForward;
     ClearSavedValue();
@@ -565,11 +572,19 @@ void DBIter::Seek(const Slice& target) {
 }
 
 void DBIter::SeekToFirst() {
+  // Don't use iter_::Seek() if we set a prefix extractor
+  // because prefix seek wiil be used.
+  if (has_prefix_extractor_) {
+    max_skip_ = std::numeric_limits<uint64_t>::max();
+  }
   direction_ = kForward;
   ClearSavedValue();
-  PERF_TIMER_AUTO(seek_internal_seek_time);
-  iter_->SeekToFirst();
-  PERF_TIMER_STOP(seek_internal_seek_time);
+
+  {
+    PERF_TIMER_GUARD(seek_internal_seek_time);
+    iter_->SeekToFirst();
+  }
+
   if (iter_->Valid()) {
     FindNextUserEntry(false /* not skipping */);
   } else {
@@ -578,11 +593,18 @@ void DBIter::SeekToFirst() {
 }
 
 void DBIter::SeekToLast() {
+  // Don't use iter_::Seek() if we set a prefix extractor
+  // because prefix seek wiil be used.
+  if (has_prefix_extractor_) {
+    max_skip_ = std::numeric_limits<uint64_t>::max();
+  }
   direction_ = kReverse;
   ClearSavedValue();
-  PERF_TIMER_AUTO(seek_internal_seek_time);
-  iter_->SeekToLast();
-  PERF_TIMER_STOP(seek_internal_seek_time);
+
+  {
+    PERF_TIMER_GUARD(seek_internal_seek_time);
+    iter_->SeekToLast();
+  }
 
   PrevInternal();
 }

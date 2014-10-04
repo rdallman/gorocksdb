@@ -6,27 +6,66 @@
 #pragma once
 #ifndef ROCKSDB_LITE
 
+#include <string>
+#include "rocksdb/table.h"
 #include "util/murmurhash.h"
 
 namespace rocksdb {
 
-static const uint32_t kMaxNumHashTable  = 64;
-
-uint64_t GetSliceMurmurHash(const Slice& s, uint32_t index,
-    uint64_t max_num_buckets) {
-  static constexpr uint32_t seeds[kMaxNumHashTable] = {
-    816922183, 506425713, 949485004, 22513986, 421427259, 500437285,
-    888981693, 847587269, 511007211, 722295391, 934013645, 566947683,
-    193618736, 428277388, 770956674, 819994962, 755946528, 40807421,
-    263144466, 241420041, 444294464, 731606396, 304158902, 563235655,
-    968740453, 336996831, 462831574, 407970157, 985877240, 637708754,
-    736932700, 205026023, 755371467, 729648411, 807744117, 46482135,
-    847092855, 620960699, 102476362, 314094354, 625838942, 550889395,
-    639071379, 834567510, 397667304, 151945969, 443634243, 196618243,
-    421986347, 407218337, 964502417, 327741231, 493359459, 452453139,
-    692216398, 108161624, 816246924, 234779764, 618949448, 496133787,
-    156374056, 316589799, 982915425, 553105889 };
-  return MurmurHash(s.data(), s.size(), seeds[index]) % max_num_buckets;
+const uint32_t kCuckooMurmurSeedMultiplier = 816922183;
+static inline uint64_t CuckooHash(
+    const Slice& user_key, uint32_t hash_cnt, uint64_t table_size_minus_one,
+    uint64_t (*get_slice_hash)(const Slice&, uint32_t, uint64_t)) {
+#ifndef NDEBUG
+  // This part is used only in unit tests.
+  if (get_slice_hash != nullptr) {
+    return get_slice_hash(user_key, hash_cnt, table_size_minus_one + 1);
+  }
+#endif
+  return MurmurHash(user_key.data(), user_key.size(),
+      kCuckooMurmurSeedMultiplier * hash_cnt) & table_size_minus_one;
 }
+
+// Cuckoo Table is designed for applications that require fast point lookups
+// but not fast range scans.
+//
+// Some assumptions:
+// - Key length and Value length are fixed.
+// - Does not support Snapshot.
+// - Does not support Merge operations.
+class CuckooTableFactory : public TableFactory {
+ public:
+  CuckooTableFactory(double hash_table_ratio, uint32_t max_search_depth,
+      uint32_t cuckoo_block_size)
+    : hash_table_ratio_(hash_table_ratio),
+      max_search_depth_(max_search_depth),
+      cuckoo_block_size_(cuckoo_block_size) {}
+  ~CuckooTableFactory() {}
+
+  const char* Name() const override { return "CuckooTable"; }
+
+  Status NewTableReader(
+      const Options& options, const EnvOptions& soptions,
+      const InternalKeyComparator& internal_comparator,
+      unique_ptr<RandomAccessFile>&& file, uint64_t file_size,
+      unique_ptr<TableReader>* table) const override;
+
+  TableBuilder* NewTableBuilder(const Options& options,
+      const InternalKeyComparator& icomparator, WritableFile* file,
+      CompressionType compression_type) const override;
+
+  // Sanitizes the specified DB Options.
+  Status SanitizeDBOptions(const DBOptions* db_opts) const override {
+    return Status::OK();
+  }
+
+  std::string GetPrintableTableOptions() const override;
+
+ private:
+  const double hash_table_ratio_;
+  const uint32_t max_search_depth_;
+  const uint32_t cuckoo_block_size_;
+};
+
 }  // namespace rocksdb
 #endif  // ROCKSDB_LITE

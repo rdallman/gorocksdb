@@ -97,7 +97,8 @@ struct ColumnFamilyOptions {
 
   // Use this if you don't need to keep the data sorted, i.e. you'll never use
   // an iterator, only Put() and Get() API calls
-  ColumnFamilyOptions* OptimizeForPointLookup();
+  ColumnFamilyOptions* OptimizeForPointLookup(
+      uint64_t block_cache_size_mb);
 
   // Default values for some parameters in ColumnFamilyOptions are not
   // optimized for heavy workloads and big datasets, which means you might
@@ -206,34 +207,6 @@ struct ColumnFamilyOptions {
   // individual write buffers.  Default: 1
   int min_write_buffer_number_to_merge;
 
-  // Control over blocks (user data is stored in a set of blocks, and
-  // a block is the unit of reading from disk).
-
-  // If non-NULL use the specified cache for blocks.
-  // If NULL, rocksdb will automatically create and use an 8MB internal cache.
-  // Default: nullptr
-  std::shared_ptr<Cache> block_cache;
-
-  // If non-NULL use the specified cache for compressed blocks.
-  // If NULL, rocksdb will not use a compressed block cache.
-  // Default: nullptr
-  std::shared_ptr<Cache> block_cache_compressed;
-
-  // Approximate size of user data packed per block.  Note that the
-  // block size specified here corresponds to uncompressed data.  The
-  // actual size of the unit read from disk may be smaller if
-  // compression is enabled.  This parameter can be changed dynamically.
-  //
-  // Default: 4K
-  size_t block_size;
-
-  // Number of keys between restart points for delta encoding of keys.
-  // This parameter can be changed dynamically.  Most clients should
-  // leave this parameter alone.
-  //
-  // Default: 16
-  int block_restart_interval;
-
   // Compress blocks using the specified compression algorithm.  This
   // parameter can be changed dynamically.
   //
@@ -267,13 +240,6 @@ struct ColumnFamilyOptions {
   // different options for compression algorithms
   CompressionOptions compression_opts;
 
-  // If non-nullptr, use the specified filter policy to reduce disk reads.
-  // Many applications will benefit from passing the result of
-  // NewBloomFilterPolicy() here.
-  //
-  // Default: nullptr
-  const FilterPolicy* filter_policy;
-
   // If non-nullptr, use the specified function to determine the
   // prefixes for keys.  These prefixes will be placed in the filter.
   // Depending on the workload, this can reduce the number of read-IOP
@@ -289,12 +255,6 @@ struct ColumnFamilyOptions {
   //
   // Default: nullptr
   std::shared_ptr<const SliceTransform> prefix_extractor;
-
-  // If true, place whole keys in the filter (not just prefixes).
-  // This must generally be true for gets to be efficient.
-  //
-  // Default: true
-  bool whole_key_filtering;
 
   // Number of levels for this database
   int num_levels;
@@ -375,18 +335,6 @@ struct ColumnFamilyOptions {
   // stop building a single file in a level->level+1 compaction.
   int max_grandparent_overlap_factor;
 
-  // We decided to remove seek compaction from RocksDB because:
-  // 1) It makes more sense for spinning disk workloads, while RocksDB is
-  // primarily designed for flash and memory,
-  // 2) It added some complexity to the important code-paths,
-  // 3) None of our internal customers were really using it.
-  //
-  // Since we removed seek compaction, this option is now obsolete.
-  // We left it here for backwards compatiblity (otherwise it would break the
-  // build), but we'll remove it at some point.
-  // Default: true
-  bool disable_seek_compaction;
-
   // Puts are delayed 0-1 ms when any level has a compaction score that exceeds
   // soft_rate_limit. This is ignored when == 0.0.
   // CONSTRAINT: soft_rate_limit <= hard_rate_limit. If this constraint does not
@@ -403,12 +351,6 @@ struct ColumnFamilyOptions {
   // there is no limit.
   // Default: 1000
   unsigned int rate_limit_delay_max_milliseconds;
-
-  // Disable block cache. If this is set to true,
-  // then no block cache should be used, and the block_cache should
-  // point to a nullptr object.
-  // Default: false
-  bool no_block_cache;
 
   // size of one block in arena memory allocation.
   // If <= 0, a proper value is automatically calculated (usually 1/10 of
@@ -432,14 +374,6 @@ struct ColumnFamilyOptions {
   // Purge duplicate/deleted keys when a memtable is flushed to storage.
   // Default: true
   bool purge_redundant_kvs_while_flush;
-
-  // This is used to close a block before it reaches the configured
-  // 'block_size'. If the percentage of free space in the current block is less
-  // than this specified number and adding a new record to the block will
-  // exceed the configured block size, then this block will be closed and the
-  // new record will be written to the next block.
-  // Default is 10.
-  int block_size_deviation;
 
   // The compaction style. Default: kCompactionStyleLevel
   CompactionStyle compaction_style;
@@ -475,9 +409,23 @@ struct ColumnFamilyOptions {
   std::shared_ptr<MemTableRepFactory> memtable_factory;
 
   // This is a factory that provides TableFactory objects.
-  // Default: a factory that provides a default implementation of
-  // Table and TableBuilder.
+  // Default: a block-based table factory that provides a default
+  // implementation of TableBuilder and TableReader with default
+  // BlockBasedTableOptions.
   std::shared_ptr<TableFactory> table_factory;
+
+  // Block-based table related options are moved to BlockBasedTableOptions.
+  // Related options that were originally here but now moved include:
+  //   no_block_cache
+  //   block_cache
+  //   block_cache_compressed
+  //   block_size
+  //   block_size_deviation
+  //   block_restart_interval
+  //   filter_policy
+  //   whole_key_filtering
+  // If you'd like to customize some of these options, you will need to
+  // use NewBlockBasedTableFactory() to construct a new table factory.
 
   // This option allows user to to collect their own interested statistics of
   // the tables.
@@ -487,7 +435,9 @@ struct ColumnFamilyOptions {
       TablePropertiesCollectorFactories;
   TablePropertiesCollectorFactories table_properties_collector_factories;
 
-  // Allows thread-safe inplace updates.
+  // Allows thread-safe inplace updates. If this is true, there is no way to
+  // achieve point-in-time consistency using snapshot or iterator (assuming
+  // concurrent updates).
   // If inplace_callback function is not set,
   //   Put(key, new_value) will update inplace the existing_value iff
   //   * key exists in current memtable
@@ -634,6 +584,7 @@ struct DBOptions {
 
   // Use to control write rate of flush and compaction. Flush has higher
   // priority than compaction. Rate limiting is disabled if nullptr.
+  // If rate limiter is enabled, bytes_per_sync is set to 1MB by default.
   // Default: nullptr
   std::shared_ptr<RateLimiter> rate_limiter;
 
@@ -680,9 +631,6 @@ struct DBOptions {
   // filesystem like ext3 that can lose files after a reboot.
   // Default: false
   bool use_fsync;
-
-  // This options is not used!!
-  int db_stats_log_interval;
 
   // A list of paths where SST files can be put into, with its target size.
   // Newer data is placed into paths specified earlier in the vector while
@@ -855,12 +803,6 @@ struct DBOptions {
   // Default: false
   bool use_adaptive_mutex;
 
-  // Allows OS to incrementally sync files to disk while they are being
-  // written, asynchronously, in the background.
-  // Issue one request for every bytes_per_sync written. 0 turns it off.
-  // Default: 0
-  uint64_t bytes_per_sync;
-
   // Allow RocksDB to use thread local storage to optimize performance.
   // Default: true
   bool allow_thread_local;
@@ -871,6 +813,16 @@ struct DBOptions {
   explicit DBOptions(const Options& options);
 
   void Dump(Logger* log) const;
+
+  // Allows OS to incrementally sync files to disk while they are being
+  // written, asynchronously, in the background.
+  // Issue one request for every bytes_per_sync written. 0 turns it off.
+  // Default: 0
+  //
+  // You may consider using rate_limiter to regulate write rate to device.
+  // When rate limiter is enabled, it automatically enables bytes_per_sync
+  // to 1MB.
+  uint64_t bytes_per_sync;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -965,18 +917,25 @@ struct ReadOptions {
   // Not supported in ROCKSDB_LITE mode!
   bool tailing;
 
+  // Enable a total order seek regardless of index format (e.g. hash index)
+  // used in the table. Some table format (e.g. plain table) may not support
+  // this option.
+  bool total_order_seek;
+
   ReadOptions()
       : verify_checksums(true),
         fill_cache(true),
         snapshot(nullptr),
         read_tier(kReadAllTier),
-        tailing(false) {}
+        tailing(false),
+        total_order_seek(false) {}
   ReadOptions(bool cksum, bool cache)
       : verify_checksums(cksum),
         fill_cache(cache),
         snapshot(nullptr),
         read_tier(kReadAllTier),
-        tailing(false) {}
+        tailing(false),
+        total_order_seek(false) {}
 };
 
 // Options that control write operations
@@ -1014,7 +973,17 @@ struct WriteOptions {
   // Default: 0
   uint64_t timeout_hint_us;
 
-  WriteOptions() : sync(false), disableWAL(false), timeout_hint_us(0) {}
+  // If true and if user is trying to write to column families that don't exist
+  // (they were dropped),  ignore the write (don't return an error). If there
+  // are multiple writes in a WriteBatch, other writes will succeed.
+  // Default: false
+  bool ignore_missing_column_families;
+
+  WriteOptions()
+      : sync(false),
+        disableWAL(false),
+        timeout_hint_us(0),
+        ignore_missing_column_families(false) {}
 };
 
 // Options that control flush operations

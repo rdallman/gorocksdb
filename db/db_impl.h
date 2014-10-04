@@ -127,6 +127,7 @@ class DBImpl : public DB {
 #ifndef ROCKSDB_LITE
   virtual Status DisableFileDeletions();
   virtual Status EnableFileDeletions(bool force);
+  virtual int IsFileDeletionsEnabled() const;
   // All the returned filenames start with "/"
   virtual Status GetLiveFiles(std::vector<std::string>&,
                               uint64_t* manifest_file_size,
@@ -309,6 +310,7 @@ class DBImpl : public DB {
   friend struct SuperVersion;
   struct CompactionState;
   struct Writer;
+  struct WriteContext;
 
   Status NewDB();
 
@@ -347,12 +349,37 @@ class DBImpl : public DB {
 
   uint64_t SlowdownAmount(int n, double bottom, double top);
 
-  // TODO(icanadi) free superversion_to_free and old_log outside of mutex
+  // Before applying write operation (such as DBImpl::Write, DBImpl::Flush)
+  // thread should grab the mutex_ and be the first on writers queue.
+  // BeginWrite is used for it.
+  // Be aware! Writer's job can be done by other thread (see DBImpl::Write
+  // for examples), so check it via w.done before applying changes.
+  //
+  // Writer* w:                writer to be placed in the queue
+  // uint64_t expiration_time: maximum time to be in the queue
+  // See also: EndWrite
+  Status BeginWrite(Writer* w, uint64_t expiration_time);
+
+  // After doing write job, we need to remove already used writers from
+  // writers_ queue and notify head of the queue about it.
+  // EndWrite is used for this.
+  //
+  // Writer* w:           Writer, that was added by BeginWrite function
+  // Writer* last_writer: Since we can join a few Writers (as DBImpl::Write
+  //                      does)
+  //                      we should pass last_writer as a parameter to
+  //                      EndWrite
+  //                      (if you don't touch other writers, just pass w)
+  // Status status:       Status of write operation
+  // See also: BeginWrite
+  void EndWrite(Writer* w, Writer* last_writer, Status status);
+
   Status MakeRoomForWrite(ColumnFamilyData* cfd,
-                          bool force /* flush even if there is room? */,
-                          autovector<SuperVersion*>* superversions_to_free,
-                          autovector<log::Writer*>* logs_to_free,
+                          WriteContext* context,
                           uint64_t expiration_time);
+
+  Status SetNewMemtableAndNewLogFile(ColumnFamilyData* cfd,
+                                     WriteContext* context);
 
   void BuildBatchGroup(Writer** last_writer,
                        autovector<WriteBatch*>* write_batch_group);
@@ -611,6 +638,16 @@ class DBImpl : public DB {
   void InstallSuperVersion(ColumnFamilyData* cfd,
                            DeletionState& deletion_state);
 
+  // Find Super version and reference it. Based on options, it might return
+  // the thread local cached one.
+  inline SuperVersion* GetAndRefSuperVersion(ColumnFamilyData* cfd);
+
+  // Un-reference the super version and return it to thread local cache if
+  // needed. If it is the last reference of the super version. Clean it up
+  // after un-referencing it.
+  inline void ReturnAndCleanupSuperVersion(ColumnFamilyData* cfd,
+                                           SuperVersion* sv);
+
 #ifndef ROCKSDB_LITE
   using DB::GetPropertiesOfAllTables;
   virtual Status GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
@@ -623,14 +660,28 @@ class DBImpl : public DB {
   Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
                  const Slice& key, std::string* value,
                  bool* value_found = nullptr);
+
+  bool GetIntPropertyInternal(ColumnFamilyHandle* column_family,
+                              DBPropertyType property_type,
+                              bool need_out_of_mutex, uint64_t* value);
 };
 
 // Sanitize db options.  The caller should delete result.info_log if
 // it is not equal to src.info_log.
 extern Options SanitizeOptions(const std::string& db,
                                const InternalKeyComparator* icmp,
-                               const InternalFilterPolicy* ipolicy,
                                const Options& src);
 extern DBOptions SanitizeOptions(const std::string& db, const DBOptions& src);
+
+// Fix user-supplied options to be reasonable
+template <class T, class V>
+static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
+  if (static_cast<V>(*ptr) > maxvalue) *ptr = maxvalue;
+  if (static_cast<V>(*ptr) < minvalue) *ptr = minvalue;
+}
+
+// Dump db file summary, implemented in util/
+extern void DumpDBFileSummary(const DBOptions& options,
+                              const std::string& dbname);
 
 }  // namespace rocksdb

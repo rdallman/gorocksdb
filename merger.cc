@@ -23,7 +23,7 @@
 #include "util/autovector.h"
 
 namespace rocksdb {
-namespace {
+namespace merger {
 typedef std::priority_queue<
           IteratorWrapper*,
           std::vector<IteratorWrapper*>,
@@ -43,7 +43,7 @@ MaxIterHeap NewMaxIterHeap(const Comparator* comparator) {
 MinIterHeap NewMinIterHeap(const Comparator* comparator) {
   return MinIterHeap(MinIteratorComparator(comparator));
 }
-}  // namespace
+}  // namespace merger
 
 const size_t kNumIterReserve = 4;
 
@@ -56,8 +56,8 @@ class MergingIterator : public Iterator {
         current_(nullptr),
         use_heap_(true),
         direction_(kForward),
-        maxHeap_(NewMaxIterHeap(comparator_)),
-        minHeap_(NewMinIterHeap(comparator_)) {
+        maxHeap_(merger::NewMaxIterHeap(comparator_)),
+        minHeap_(merger::NewMinIterHeap(comparator_)) {
     children_.resize(n);
     for (int i = 0; i < n; i++) {
       children_[i].Set(children[i]);
@@ -116,12 +116,12 @@ class MergingIterator : public Iterator {
     // Invalidate the heap.
     use_heap_ = false;
     IteratorWrapper* first_child = nullptr;
-    PERF_TIMER_DECLARE();
 
     for (auto& child : children_) {
-      PERF_TIMER_START(seek_child_seek_time);
-      child.Seek(target);
-      PERF_TIMER_STOP(seek_child_seek_time);
+      {
+        PERF_TIMER_GUARD(seek_child_seek_time);
+        child.Seek(target);
+      }
       PERF_COUNTER_ADD(seek_child_seek_count, 1);
 
       if (child.Valid()) {
@@ -134,24 +134,21 @@ class MergingIterator : public Iterator {
           } else {
             // We have more than one children with valid keys. Initialize
             // the heap and put the first child into the heap.
-            PERF_TIMER_START(seek_min_heap_time);
+            PERF_TIMER_GUARD(seek_min_heap_time);
             ClearHeaps();
             minHeap_.push(first_child);
-            PERF_TIMER_STOP(seek_min_heap_time);
           }
         }
         if (use_heap_) {
-          PERF_TIMER_START(seek_min_heap_time);
+          PERF_TIMER_GUARD(seek_min_heap_time);
           minHeap_.push(&child);
-          PERF_TIMER_STOP(seek_min_heap_time);
         }
       }
     }
     if (use_heap_) {
       // If heap is valid, need to put the smallest key to curent_.
-      PERF_TIMER_START(seek_min_heap_time);
+      PERF_TIMER_GUARD(seek_min_heap_time);
       FindSmallest();
-      PERF_TIMER_STOP(seek_min_heap_time);
     } else {
       // The heap is not valid, then the current_ iterator is the first
       // one, or null if there is no first child.
@@ -274,8 +271,8 @@ class MergingIterator : public Iterator {
     kReverse
   };
   Direction direction_;
-  MaxIterHeap maxHeap_;
-  MinIterHeap minHeap_;
+  merger::MaxIterHeap maxHeap_;
+  merger::MinIterHeap minHeap_;
 };
 
 void MergingIterator::FindSmallest() {
@@ -302,8 +299,8 @@ void MergingIterator::FindLargest() {
 
 void MergingIterator::ClearHeaps() {
   use_heap_ = true;
-  maxHeap_ = NewMaxIterHeap(comparator_);
-  minHeap_ = NewMinIterHeap(comparator_);
+  maxHeap_ = merger::NewMaxIterHeap(comparator_);
+  minHeap_ = merger::NewMinIterHeap(comparator_);
 }
 
 Iterator* NewMergingIterator(const Comparator* cmp, Iterator** list, int n,

@@ -6,8 +6,8 @@
   Use of this source code is governed by a BSD-style license that can be
   found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-  C bindings for leveldb.  May be useful as a stable ABI that can be
-  used by programs that keep leveldb in a shared library, or for
+  C bindings for rocksdb.  May be useful as a stable ABI that can be
+  used by programs that keep rocksdb in a shared library, or for
   a JNI api.
 
   Does not support:
@@ -61,6 +61,10 @@ typedef struct rocksdb_compactionfiltercontext_t
     rocksdb_compactionfiltercontext_t;
 typedef struct rocksdb_compactionfilterfactory_t
     rocksdb_compactionfilterfactory_t;
+typedef struct rocksdb_compactionfilterv2_t
+    rocksdb_compactionfilterv2_t;
+typedef struct rocksdb_compactionfilterfactoryv2_t
+    rocksdb_compactionfilterfactoryv2_t;
 typedef struct rocksdb_comparator_t      rocksdb_comparator_t;
 typedef struct rocksdb_env_t             rocksdb_env_t;
 typedef struct rocksdb_fifo_compaction_options_t rocksdb_fifo_compaction_options_t;
@@ -71,6 +75,8 @@ typedef struct rocksdb_iterator_t        rocksdb_iterator_t;
 typedef struct rocksdb_logger_t          rocksdb_logger_t;
 typedef struct rocksdb_mergeoperator_t   rocksdb_mergeoperator_t;
 typedef struct rocksdb_options_t         rocksdb_options_t;
+typedef struct rocksdb_block_based_table_options_t
+    rocksdb_block_based_table_options_t;
 typedef struct rocksdb_randomfile_t      rocksdb_randomfile_t;
 typedef struct rocksdb_readoptions_t     rocksdb_readoptions_t;
 typedef struct rocksdb_seqfile_t         rocksdb_seqfile_t;
@@ -342,6 +348,34 @@ extern void rocksdb_writebatch_iterate(
     void (*deleted)(void*, const char* k, size_t klen));
 extern const char* rocksdb_writebatch_data(rocksdb_writebatch_t*, size_t *size);
 
+/* Block based table options */
+
+extern rocksdb_block_based_table_options_t*
+    rocksdb_block_based_options_create();
+extern void rocksdb_block_based_options_destroy(
+    rocksdb_block_based_table_options_t* options);
+extern void rocksdb_block_based_options_set_block_size(
+    rocksdb_block_based_table_options_t* options, size_t block_size);
+extern void rocksdb_block_based_options_set_block_size_deviation(
+    rocksdb_block_based_table_options_t* options, int block_size_deviation);
+extern void rocksdb_block_based_options_set_block_restart_interval(
+    rocksdb_block_based_table_options_t* options, int block_restart_interval);
+extern void rocksdb_block_based_options_set_filter_policy(
+    rocksdb_block_based_table_options_t* options,
+    rocksdb_filterpolicy_t* filter_policy);
+extern void rocksdb_block_based_options_set_no_block_cache(
+    rocksdb_block_based_table_options_t* options,
+    unsigned char no_block_cache);
+extern void rocksdb_block_based_options_set_block_cache(
+    rocksdb_block_based_table_options_t* options, rocksdb_cache_t* block_cache);
+extern void rocksdb_block_based_options_set_block_cache_compressed(
+    rocksdb_block_based_table_options_t* options,
+    rocksdb_cache_t* block_cache_compressed);
+extern void rocksdb_block_based_options_set_whole_key_filtering(
+    rocksdb_block_based_table_options_t*, unsigned char);
+extern void rocksdb_options_set_block_based_table_factory(
+    rocksdb_options_t *opt, rocksdb_block_based_table_options_t* table_options);
+
 /* Options */
 
 extern rocksdb_options_t* rocksdb_options_create();
@@ -349,7 +383,7 @@ extern void rocksdb_options_destroy(rocksdb_options_t*);
 extern void rocksdb_options_increase_parallelism(
     rocksdb_options_t* opt, int total_threads);
 extern void rocksdb_options_optimize_for_point_lookup(
-    rocksdb_options_t* opt);
+    rocksdb_options_t* opt, uint64_t block_cache_size_mb);
 extern void rocksdb_options_optimize_level_style_compaction(
     rocksdb_options_t* opt, uint64_t memtable_memory_budget);
 extern void rocksdb_options_optimize_universal_style_compaction(
@@ -359,18 +393,19 @@ extern void rocksdb_options_set_compaction_filter(
     rocksdb_compactionfilter_t*);
 extern void rocksdb_options_set_compaction_filter_factory(
     rocksdb_options_t*, rocksdb_compactionfilterfactory_t*);
+extern void rocksdb_options_set_compaction_filter_factory_v2(
+    rocksdb_options_t*,
+    rocksdb_compactionfilterfactoryv2_t*);
 extern void rocksdb_options_set_comparator(
     rocksdb_options_t*,
     rocksdb_comparator_t*);
-extern void rocksdb_options_set_merge_operator(rocksdb_options_t*,
-                                               rocksdb_mergeoperator_t*);
+extern void rocksdb_options_set_merge_operator(
+    rocksdb_options_t*,
+    rocksdb_mergeoperator_t*);
 extern void rocksdb_options_set_compression_per_level(
   rocksdb_options_t* opt,
   int* level_values,
   size_t num_levels);
-extern void rocksdb_options_set_filter_policy(
-    rocksdb_options_t*,
-    rocksdb_filterpolicy_t*);
 extern void rocksdb_options_set_create_if_missing(
     rocksdb_options_t*, unsigned char);
 extern void rocksdb_options_set_create_missing_column_families(
@@ -384,13 +419,8 @@ extern void rocksdb_options_set_info_log(rocksdb_options_t*, rocksdb_logger_t*);
 extern void rocksdb_options_set_info_log_level(rocksdb_options_t*, int);
 extern void rocksdb_options_set_write_buffer_size(rocksdb_options_t*, size_t);
 extern void rocksdb_options_set_max_open_files(rocksdb_options_t*, int);
-extern void rocksdb_options_set_cache(rocksdb_options_t*, rocksdb_cache_t*);
-extern void rocksdb_options_set_cache_compressed(rocksdb_options_t*, rocksdb_cache_t*);
-extern void rocksdb_options_set_block_size(rocksdb_options_t*, size_t);
-extern void rocksdb_options_set_block_restart_interval(rocksdb_options_t*, int);
 extern void rocksdb_options_set_compression_options(
     rocksdb_options_t*, int, int, int);
-extern void rocksdb_options_set_whole_key_filtering(rocksdb_options_t*, unsigned char);
 extern void rocksdb_options_set_prefix_extractor(
     rocksdb_options_t*, rocksdb_slicetransform_t*);
 extern void rocksdb_options_set_num_levels(rocksdb_options_t*, int);
@@ -441,8 +471,6 @@ extern void rocksdb_options_set_arena_block_size(
     rocksdb_options_t*, size_t);
 extern void rocksdb_options_set_use_fsync(
     rocksdb_options_t*, int);
-extern void rocksdb_options_set_db_stats_log_interval(
-    rocksdb_options_t*, int);
 extern void rocksdb_options_set_db_log_dir(
     rocksdb_options_t*, const char*);
 extern void rocksdb_options_set_wal_dir(
@@ -485,7 +513,6 @@ extern void rocksdb_options_set_max_sequential_skip_in_iterations(
     rocksdb_options_t*, uint64_t);
 extern void rocksdb_options_set_disable_data_sync(rocksdb_options_t*, int);
 extern void rocksdb_options_set_disable_auto_compactions(rocksdb_options_t*, int);
-extern void rocksdb_options_set_disable_seek_compaction(rocksdb_options_t*, int);
 extern void rocksdb_options_set_delete_obsolete_files_period_micros(
     rocksdb_options_t*, uint64_t);
 extern void rocksdb_options_set_source_compaction_factor(rocksdb_options_t*, int);
@@ -570,6 +597,35 @@ extern rocksdb_compactionfilterfactory_t*
         const char* (*name)(void*));
 extern void rocksdb_compactionfilterfactory_destroy(
     rocksdb_compactionfilterfactory_t*);
+
+/* Compaction Filter V2 */
+
+extern rocksdb_compactionfilterv2_t* rocksdb_compactionfilterv2_create(
+    void* state,
+    void (*destructor)(void*),
+    // num_keys specifies the number of array entries in every *list parameter.
+    // New values added to the new_values_list should be malloc'd and will be
+    // freed by the caller. Specify true in the to_delete_list to remove an
+    // entry during compaction; false to keep it.
+    void (*filter)(
+        void*, int level, size_t num_keys,
+        const char* const* keys_list, const size_t* keys_list_sizes,
+        const char* const* existing_values_list, const size_t* existing_values_list_sizes,
+        char** new_values_list, size_t* new_values_list_sizes,
+        unsigned char* to_delete_list),
+    const char* (*name)(void*));
+extern void rocksdb_compactionfilterv2_destroy(rocksdb_compactionfilterv2_t*);
+
+/* Compaction Filter Factory V2 */
+
+extern rocksdb_compactionfilterfactoryv2_t* rocksdb_compactionfilterfactoryv2_create(
+    void* state,
+    rocksdb_slicetransform_t* prefix_extractor,
+    void (*destructor)(void*),
+    rocksdb_compactionfilterv2_t* (*create_compaction_filter_v2)(
+        void*, const rocksdb_compactionfiltercontext_t* context),
+    const char* (*name)(void*));
+extern void rocksdb_compactionfilterfactoryv2_destroy(rocksdb_compactionfilterfactoryv2_t*);
 
 /* Comparator */
 

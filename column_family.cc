@@ -49,21 +49,10 @@ ColumnFamilyHandleImpl::~ColumnFamilyHandleImpl() {
 
 uint32_t ColumnFamilyHandleImpl::GetID() const { return cfd()->GetID(); }
 
-namespace {
-// Fix user-supplied options to be reasonable
-template <class T, class V>
-static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
-  if (static_cast<V>(*ptr) > maxvalue) *ptr = maxvalue;
-  if (static_cast<V>(*ptr) < minvalue) *ptr = minvalue;
-}
-}  // anonymous namespace
-
 ColumnFamilyOptions SanitizeOptions(const InternalKeyComparator* icmp,
-                                    const InternalFilterPolicy* ipolicy,
                                     const ColumnFamilyOptions& src) {
   ColumnFamilyOptions result = src;
   result.comparator = icmp;
-  result.filter_policy = (src.filter_policy != nullptr) ? ipolicy : nullptr;
 #ifdef OS_MACOSX
   // TODO(icanadi) make write_buffer_size uint64_t instead of size_t
   ClipToRange(&result.write_buffer_size, ((size_t)64) << 10, ((size_t)1) << 30);
@@ -79,13 +68,7 @@ ColumnFamilyOptions SanitizeOptions(const InternalKeyComparator* icmp,
   result.min_write_buffer_number_to_merge =
       std::min(result.min_write_buffer_number_to_merge,
                result.max_write_buffer_number - 1);
-  if (result.block_cache == nullptr && !result.no_block_cache) {
-    result.block_cache = NewLRUCache(8 << 20);
-  }
   result.compression_per_level = src.compression_per_level;
-  if (result.block_size_deviation < 0 || result.block_size_deviation > 100) {
-    result.block_size_deviation = 0;
-  }
   if (result.max_mem_compaction_level >= result.num_levels) {
     result.max_mem_compaction_level = result.num_levels - 1;
   }
@@ -191,8 +174,7 @@ void SuperVersionUnrefHandle(void* ptr) {
 }
 }  // anonymous namespace
 
-ColumnFamilyData::ColumnFamilyData(const std::string& dbname, uint32_t id,
-                                   const std::string& name,
+ColumnFamilyData::ColumnFamilyData(uint32_t id, const std::string& name,
                                    Version* dummy_versions, Cache* table_cache,
                                    const ColumnFamilyOptions& options,
                                    const DBOptions* db_options,
@@ -205,9 +187,7 @@ ColumnFamilyData::ColumnFamilyData(const std::string& dbname, uint32_t id,
       refs_(0),
       dropped_(false),
       internal_comparator_(options.comparator),
-      internal_filter_policy_(options.filter_policy),
-      options_(*db_options, SanitizeOptions(&internal_comparator_,
-                                            &internal_filter_policy_, options)),
+      options_(*db_options, SanitizeOptions(&internal_comparator_, options)),
       mem_(nullptr),
       imm_(options_.min_write_buffer_number_to_merge),
       super_version_(nullptr),
@@ -485,7 +465,7 @@ ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
                                  const EnvOptions& storage_options,
                                  Cache* table_cache)
     : max_column_family_(0),
-      dummy_cfd_(new ColumnFamilyData(dbname, 0, "", nullptr, nullptr,
+      dummy_cfd_(new ColumnFamilyData(0, "", nullptr, nullptr,
                                       ColumnFamilyOptions(), db_options,
                                       storage_options_, nullptr)),
       default_cfd_cache_(nullptr),
@@ -556,8 +536,8 @@ ColumnFamilyData* ColumnFamilySet::CreateColumnFamily(
     const ColumnFamilyOptions& options) {
   assert(column_families_.find(name) == column_families_.end());
   ColumnFamilyData* new_cfd =
-      new ColumnFamilyData(db_name_, id, name, dummy_versions, table_cache_,
-                           options, db_options_, storage_options_, this);
+      new ColumnFamilyData(id, name, dummy_versions, table_cache_, options,
+                           db_options_, storage_options_, this);
   Lock();
   column_families_.insert({name, id});
   column_family_data_.insert({id, new_cfd});
@@ -639,6 +619,15 @@ const Options* ColumnFamilyMemTablesImpl::GetOptions() const {
 ColumnFamilyHandle* ColumnFamilyMemTablesImpl::GetColumnFamilyHandle() {
   assert(current_ != nullptr);
   return &handle_;
+}
+
+uint32_t GetColumnFamilyID(ColumnFamilyHandle* column_family) {
+  uint32_t column_family_id = 0;
+  if (column_family != nullptr) {
+    auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
+    column_family_id = cfh->GetID();
+  }
+  return column_family_id;
 }
 
 }  // namespace rocksdb

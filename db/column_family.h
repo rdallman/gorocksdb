@@ -113,7 +113,6 @@ struct SuperVersion {
 };
 
 extern ColumnFamilyOptions SanitizeOptions(const InternalKeyComparator* icmp,
-                                           const InternalFilterPolicy* ipolicy,
                                            const ColumnFamilyOptions& src);
 
 class ColumnFamilySet;
@@ -248,9 +247,9 @@ class ColumnFamilyData {
 
  private:
   friend class ColumnFamilySet;
-  ColumnFamilyData(const std::string& dbname, uint32_t id,
-                   const std::string& name, Version* dummy_versions,
-                   Cache* table_cache, const ColumnFamilyOptions& options,
+  ColumnFamilyData(uint32_t id, const std::string& name,
+                   Version* dummy_versions, Cache* table_cache,
+                   const ColumnFamilyOptions& options,
                    const DBOptions* db_options,
                    const EnvOptions& storage_options,
                    ColumnFamilySet* column_family_set);
@@ -272,7 +271,6 @@ class ColumnFamilyData {
   bool dropped_;               // true if client dropped it
 
   const InternalKeyComparator internal_comparator_;
-  const InternalFilterPolicy internal_filter_policy_;
 
   Options const options_;
 
@@ -456,5 +454,7 @@ class ColumnFamilyMemTablesImpl : public ColumnFamilyMemTables {
   ColumnFamilyData* current_;
   ColumnFamilyHandleInternal handle_;
 };
+
+extern uint32_t GetColumnFamilyID(ColumnFamilyHandle* column_family);
 
 }  // namespace rocksdb

@@ -57,8 +57,7 @@ class Repairer {
       : dbname_(dbname),
         env_(options.env),
         icmp_(options.comparator),
-        ipolicy_(options.filter_policy),
-        options_(SanitizeOptions(dbname, &icmp_, &ipolicy_, options)),
+        options_(SanitizeOptions(dbname, &icmp_, options)),
         raw_table_cache_(
             // TableCache can be small since we expect each table to be opened
             // once.
@@ -109,7 +108,6 @@ class Repairer {
   std::string const dbname_;
   Env* const env_;
   InternalKeyComparator const icmp_;
-  InternalFilterPolicy const ipolicy_;
   Options const options_;
   std::shared_ptr<Cache> raw_table_cache_;
   TableCache* table_cache_;
@@ -239,7 +237,8 @@ class Repairer {
     FileMetaData meta;
     meta.fd = FileDescriptor(next_file_number_++, 0, 0);
     ReadOptions ro;
-    Iterator* iter = mem->NewIterator(ro, true /* enforce_total_order */);
+    ro.total_order_seek = true;
+    Iterator* iter = mem->NewIterator(ro);
     status = BuildTable(dbname_, env_, options_, storage_options_, table_cache_,
                         iter, &meta, icmp_, 0, 0, kNoCompression);
     delete iter;
@@ -265,9 +264,10 @@ class Repairer {
       if (!status.ok()) {
         std::string fname = TableFileName(
             options_.db_paths, t.meta.fd.GetNumber(), t.meta.fd.GetPathId());
-        Log(options_.info_log, "Table #%s: ignoring %s",
-            FormatFileNumber(t.meta.fd.GetNumber(), t.meta.fd.GetPathId())
-                .c_str(),
+        char file_num_buf[kFormatFileNumberBufSize];
+        FormatFileNumber(t.meta.fd.GetNumber(), t.meta.fd.GetPathId(),
+                         file_num_buf, sizeof(file_num_buf));
+        Log(options_.info_log, "Table #%s: ignoring %s", file_num_buf,
             status.ToString().c_str());
         ArchiveFile(fname);
       } else {

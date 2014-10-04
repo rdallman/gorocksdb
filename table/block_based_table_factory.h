@@ -16,6 +16,7 @@
 #include "rocksdb/flush_block_policy.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
+#include "db/dbformat.h"
 
 namespace rocksdb {
 
@@ -42,6 +43,13 @@ class BlockBasedTableFactory : public TableFactory {
   TableBuilder* NewTableBuilder(
       const Options& options, const InternalKeyComparator& internal_comparator,
       WritableFile* file, CompressionType compression_type) const override;
+
+  // Sanitizes the specified DB Options.
+  Status SanitizeDBOptions(const DBOptions* db_opts) const override {
+    return Status::OK();
+  }
+
+  std::string GetPrintableTableOptions() const override;
 
  private:
   BlockBasedTableOptions table_options_;

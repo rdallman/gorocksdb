@@ -219,6 +219,7 @@ enum Histograms : uint32_t {
   HARD_RATE_LIMIT_DELAY_COUNT,
   SOFT_RATE_LIMIT_DELAY_COUNT,
   NUM_FILES_IN_SINGLE_COMPACTION,
+  DB_SEEK,
   HISTOGRAM_ENUM_MAX,
 };
 
@@ -241,6 +242,7 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
   { HARD_RATE_LIMIT_DELAY_COUNT, "rocksdb.hard.rate.limit.delay.count"},
   { SOFT_RATE_LIMIT_DELAY_COUNT, "rocksdb.soft.rate.limit.delay.count"},
   { NUM_FILES_IN_SINGLE_COMPACTION, "rocksdb.numfiles.in.singlecompaction" },
+  { DB_SEEK, "rocksdb.db.seek.micros" },
 };
 
 struct HistogramData {
@@ -265,7 +267,10 @@ class Statistics {
   virtual void measureTime(uint32_t histogramType, uint64_t time) = 0;
 
   // String representation of the statistic object.
-  virtual std::string ToString() const = 0;
+  virtual std::string ToString() const {
+    // Do nothing by default
+    return std::string("ToString(): not implemented");
+  }
 
   // Override this function to disable particular histogram collection
   virtual bool HistEnabledForType(uint32_t type) const {

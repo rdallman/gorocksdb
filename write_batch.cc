@@ -27,6 +27,7 @@
 #include "rocksdb/merge_operator.h"
 #include "db/dbformat.h"
 #include "db/db_impl.h"
+#include "db/column_family.h"
 #include "db/memtable.h"
 #include "db/snapshot.h"
 #include "db/write_batch_internal.h"
@@ -80,6 +81,58 @@ int WriteBatch::Count() const {
   return WriteBatchInternal::Count(this);
 }
 
+Status ReadRecordFromWriteBatch(Slice* input, char* tag,
+                                uint32_t* column_family, Slice* key,
+                                Slice* value, Slice* blob) {
+  assert(key != nullptr && value != nullptr);
+  *tag = (*input)[0];
+  input->remove_prefix(1);
+  *column_family = 0;  // default
+  switch (*tag) {
+    case kTypeColumnFamilyValue:
+      if (!GetVarint32(input, column_family)) {
+        return Status::Corruption("bad WriteBatch Put");
+      }
+    // intentional fallthrough
+    case kTypeValue:
+      if (!GetLengthPrefixedSlice(input, key) ||
+          !GetLengthPrefixedSlice(input, value)) {
+        return Status::Corruption("bad WriteBatch Put");
+      }
+      break;
+    case kTypeColumnFamilyDeletion:
+      if (!GetVarint32(input, column_family)) {
+        return Status::Corruption("bad WriteBatch Delete");
+      }
+    // intentional fallthrough
+    case kTypeDeletion:
+      if (!GetLengthPrefixedSlice(input, key)) {
+        return Status::Corruption("bad WriteBatch Delete");
+      }
+      break;
+    case kTypeColumnFamilyMerge:
+      if (!GetVarint32(input, column_family)) {
+        return Status::Corruption("bad WriteBatch Merge");
+      }
+    // intentional fallthrough
+    case kTypeMerge:
+      if (!GetLengthPrefixedSlice(input, key) ||
+          !GetLengthPrefixedSlice(input, value)) {
+        return Status::Corruption("bad WriteBatch Merge");
+      }
+      break;
+    case kTypeLogData:
+      assert(blob != nullptr);
+      if (!GetLengthPrefixedSlice(input, blob)) {
+        return Status::Corruption("bad WriteBatch Blob");
+      }
+      break;
+    default:
+      return Status::Corruption("unknown WriteBatch tag");
+  }
+  return Status::OK();
+}
+
 Status WriteBatch::Iterate(Handler* handler) const {
   Slice input(rep_);
   if (input.size() < kHeader) {
@@ -91,57 +144,33 @@ Status WriteBatch::Iterate(Handler* handler) const {
   int found = 0;
   Status s;
   while (s.ok() && !input.empty() && handler->Continue()) {
-    char tag = input[0];
-    input.remove_prefix(1);
+    char tag = 0;
     uint32_t column_family = 0;  // default
+
+    s = ReadRecordFromWriteBatch(&input, &tag, &column_family, &key, &value,
+                                 &blob);
+    if (!s.ok()) {
+      return s;
+    }
+
     switch (tag) {
       case kTypeColumnFamilyValue:
-        if (!GetVarint32(&input, &column_family)) {
-          return Status::Corruption("bad WriteBatch Put");
-        }
-      // intentional fallthrough
       case kTypeValue:
-        if (GetLengthPrefixedSlice(&input, &key) &&
-            GetLengthPrefixedSlice(&input, &value)) {
-          s = handler->PutCF(column_family, key, value);
-          found++;
-        } else {
-          return Status::Corruption("bad WriteBatch Put");
-        }
+        s = handler->PutCF(column_family, key, value);
+        found++;
         break;
       case kTypeColumnFamilyDeletion:
-        if (!GetVarint32(&input, &column_family)) {
-          return Status::Corruption("bad WriteBatch Delete");
-        }
-      // intentional fallthrough
       case kTypeDeletion:
-        if (GetLengthPrefixedSlice(&input, &key)) {
-          s = handler->DeleteCF(column_family, key);
-          found++;
-        } else {
-          return Status::Corruption("bad WriteBatch Delete");
-        }
+        s = handler->DeleteCF(column_family, key);
+        found++;
         break;
       case kTypeColumnFamilyMerge:
-        if (!GetVarint32(&input, &column_family)) {
-          return Status::Corruption("bad WriteBatch Merge");
-        }
-      // intentional fallthrough
       case kTypeMerge:
-        if (GetLengthPrefixedSlice(&input, &key) &&
-            GetLengthPrefixedSlice(&input, &value)) {
-          s = handler->MergeCF(column_family, key, value);
-          found++;
-        } else {
-          return Status::Corruption("bad WriteBatch Merge");
-        }
+        s = handler->MergeCF(column_family, key, value);
+        found++;
         break;
       case kTypeLogData:
-        if (GetLengthPrefixedSlice(&input, &blob)) {
-          handler->LogData(blob);
-        } else {
-          return Status::Corruption("bad WriteBatch Blob");
-        }
+        handler->LogData(blob);
         break;
       default:
         return Status::Corruption("unknown WriteBatch tag");
@@ -185,17 +214,6 @@ void WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
   PutLengthPrefixedSlice(&b->rep_, key);
   PutLengthPrefixedSlice(&b->rep_, value);
 }
-
-namespace {
-inline uint32_t GetColumnFamilyID(ColumnFamilyHandle* column_family) {
-  uint32_t column_family_id = 0;
-  if (column_family != nullptr) {
-    auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
-    column_family_id = cfh->GetID();
-  }
-  return column_family_id;
-}
-}  // namespace
 
 void WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice& key,
                      const Slice& value) {
@@ -281,17 +299,17 @@ class MemTableInserter : public WriteBatch::Handler {
  public:
   SequenceNumber sequence_;
   ColumnFamilyMemTables* cf_mems_;
-  bool recovery_;
+  bool ignore_missing_column_families_;
   uint64_t log_number_;
   DBImpl* db_;
   const bool dont_filter_deletes_;
 
   MemTableInserter(SequenceNumber sequence, ColumnFamilyMemTables* cf_mems,
-                   bool recovery, uint64_t log_number, DB* db,
-                   const bool dont_filter_deletes)
+                   bool ignore_missing_column_families, uint64_t log_number,
+                   DB* db, const bool dont_filter_deletes)
       : sequence_(sequence),
         cf_mems_(cf_mems),
-        recovery_(recovery),
+        ignore_missing_column_families_(ignore_missing_column_families),
         log_number_(log_number),
         db_(reinterpret_cast<DBImpl*>(db)),
         dont_filter_deletes_(dont_filter_deletes) {
@@ -303,12 +321,18 @@ class MemTableInserter : public WriteBatch::Handler {
 
   bool SeekToColumnFamily(uint32_t column_family_id, Status* s) {
     bool found = cf_mems_->Seek(column_family_id);
-    if (recovery_ && (!found || log_number_ < cf_mems_->GetLogNumber())) {
-      // if in recovery envoronment:
-      // * If column family was not found, it might mean that the WAL write
-      // batch references to the column family that was dropped after the
-      // insert. We don't want to fail the whole write batch in that case -- we
-      // just ignore the update.
+    if (!found) {
+      if (ignore_missing_column_families_) {
+        *s = Status::OK();
+      } else {
+        *s = Status::InvalidArgument(
+            "Invalid column family specified in write batch");
+      }
+      return false;
+    }
+    if (log_number_ != 0 && log_number_ < cf_mems_->GetLogNumber()) {
+      // This is true only in recovery environment (log_number_ is always 0 in
+      // non-recovery, regular write code-path)
       // * If log_number_ < cf_mems_->GetLogNumber(), this means that column
       // family already contains updates from this log. We can't apply updates
       // twice because of update-in-place or merge workloads -- ignore the
@@ -316,18 +340,8 @@ class MemTableInserter : public WriteBatch::Handler {
       *s = Status::OK();
       return false;
     }
-    if (!found) {
-      assert(!recovery_);
-      // If the column family was not found in non-recovery enviornment
-      // (client's write code-path), we have to fail the write and return
-      // the failure status to the client.
-      *s = Status::InvalidArgument(
-          "Invalid column family specified in write batch");
-      return false;
-    }
     return true;
   }
-
   virtual Status PutCF(uint32_t column_family_id, const Slice& key,
                        const Slice& value) {
     Status seek_status;
@@ -485,10 +499,12 @@ class MemTableInserter : public WriteBatch::Handler {
 
 Status WriteBatchInternal::InsertInto(const WriteBatch* b,
                                       ColumnFamilyMemTables* memtables,
-                                      bool recovery, uint64_t log_number,
-                                      DB* db, const bool dont_filter_deletes) {
+                                      bool ignore_missing_column_families,
+                                      uint64_t log_number, DB* db,
+                                      const bool dont_filter_deletes) {
   MemTableInserter inserter(WriteBatchInternal::Sequence(b), memtables,
-                            recovery, log_number, db, dont_filter_deletes);
+                            ignore_missing_column_families, log_number, db,
+                            dont_filter_deletes);
   return b->Iterate(&inserter);
 }
 

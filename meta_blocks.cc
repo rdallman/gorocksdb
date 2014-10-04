@@ -16,9 +16,7 @@
 namespace rocksdb {
 
 MetaIndexBuilder::MetaIndexBuilder()
-    : meta_index_block_(
-        new BlockBuilder(1 /* restart interval */, BytewiseComparator())) {
-}
+    : meta_index_block_(new BlockBuilder(1 /* restart interval */)) {}
 
 void MetaIndexBuilder::Add(const std::string& key,
                            const BlockHandle& handle) {
@@ -35,9 +33,7 @@ Slice MetaIndexBuilder::Finish() {
 }
 
 PropertyBlockBuilder::PropertyBlockBuilder()
-  : properties_block_(
-      new BlockBuilder(1 /* restart interval */, BytewiseComparator())) {
-}
+    : properties_block_(new BlockBuilder(1 /* restart interval */)) {}
 
 void PropertyBlockBuilder::Add(const std::string& name,
                                const std::string& val) {
@@ -253,8 +249,7 @@ Status ReadTableProperties(RandomAccessFile* file, uint64_t file_size,
     s = ReadProperties(meta_iter->value(), file, footer, env, info_log,
                        properties);
   } else {
-    s = Status::Corruption("Unable to read the property block.");
-    Log(WARN_LEVEL, info_log, "Cannot find Properties block from file.");
+    s = Status::NotFound();
   }
 
   return s;
