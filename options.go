@@ -52,11 +52,12 @@ type Options struct {
 	c *C.rocksdb_options_t
 
 	// hold references for GC
-	cmp *Comparator
-	mo  *MergeOperator
-	env *Env
-	st  *SliceTransform
-	cf  *CompactionFilter
+	cmp  *Comparator
+	mo   *MergeOperator
+	env  *Env
+	st   *SliceTransform
+	cf   *CompactionFilter
+	bbto *BlockBasedTableOptions
 
 	// We keep these so we can free their memory in Destroy.
 	ccmp *C.rocksdb_comparator_t
@@ -909,5 +910,6 @@ func (self *Options) Destroy() {
 }
 
 func (self *Options) SetBlockBasedTableFactory(value *BlockBasedTableOptions) {
+	self.bbto = value
 	C.rocksdb_options_set_block_based_table_factory(self.c, value.c)
 }
