@@ -64,7 +64,6 @@ type Options struct {
 	cmo  *C.rocksdb_mergeoperator_t
 	cst  *C.rocksdb_slicetransform_t
 	ccf  *C.rocksdb_compactionfilter_t
-	cbbto *C.rocksdb_block_based_table_options_t
 }
 
 // NewDefaultOptions creates the default Options.
@@ -902,9 +901,6 @@ func (self *Options) Destroy() {
 	if self.ccf != nil {
 		C.rocksdb_compactionfilter_destroy(self.ccf)
 	}
-	if self.cbbto != nil {
-		self.cbbto = nil
-	}
 	self.c = nil
 	self.cmp = nil
 	self.mo = nil
@@ -916,6 +912,5 @@ func (self *Options) Destroy() {
 
 func (self *Options) SetBlockBasedTableFactory(value *BlockBasedTableOptions) {
 	self.bbto = value
-	self.cbbto = value.c
 	C.rocksdb_options_set_block_based_table_factory(self.c, value.c)
 }
