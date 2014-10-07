@@ -7,8 +7,10 @@ import (
 	"unsafe"
 )
 
-// BlockBasedTableOptions represent TODO me needing to lookup proper words
-
+// Block-based table related options are moved to BlockBasedTableOptions.
+// If you'd like to customize some of these options, you will need to
+// use NewBlockBasedTableFactory() to construct a new table factory.
+// For advanced user only
 type BlockBasedTableOptions struct {
 	c *C.rocksdb_block_based_table_options_t
 
@@ -26,11 +28,12 @@ func NewDefaultBlockBasedTableOptions() *BlockBasedTableOptions {
 	return NewNativeBlockBasedTableOptions(C.rocksdb_block_based_options_create())
 }
 
-// NewNativeBlockBasedTableOptions creates a WriteOptions object.
+// NewNativeBlockBasedTableOptions creates a BlockBasedTableOptions object.
 func NewNativeBlockBasedTableOptions(c *C.rocksdb_block_based_table_options_t) *BlockBasedTableOptions {
 	return &BlockBasedTableOptions{c: c}
 }
 
+// Destroy deallocates the BlockBasedTableOptions object.
 func (self *BlockBasedTableOptions) Destroy() {
 	C.rocksdb_block_based_options_destroy(self.c)
 	self.c = nil
@@ -58,10 +61,18 @@ func (self *BlockBasedTableOptions) SetBlockSizeDeviation(block_size_deviation i
 	C.rocksdb_block_based_options_set_block_size_deviation(self.c, C.int(block_size_deviation))
 }
 
+// Number of keys between restart points for delta encoding of keys.
+// This parameter can be changed dynamically. Most clients should
+// leave this parameter alone.
+// Default: 16
 func (self *BlockBasedTableOptions) SetBlockRestartInterval(block_restart_interval int) {
 	C.rocksdb_block_based_options_set_block_restart_interval(self.c, C.int(block_restart_interval))
 }
 
+// If set use the specified filter policy to reduce disk reads.
+// Many applications will benefit from passing the result of
+// NewBloomFilterPolicy() here.
+// Default: nil
 func (self *BlockBasedTableOptions) SetFilterPolicy(value FilterPolicy) {
 	if nfp, ok := value.(nativeFilterPolicy); ok {
 		self.cfp = nfp.c
@@ -92,11 +103,8 @@ func (self *BlockBasedTableOptions) SetBlockCache(value *Cache) {
 	C.rocksdb_block_based_options_set_block_cache(self.c, value.c)
 }
 
-// Control over blocks (user data is stored in a set of blocks, and
-// a block is the unit of reading from disk).
-//
-// If set, use the specified cache for blocks.
-// If nil, rocksdb will automatically create and use an 8MB internal cache.
+// If set, use the specified cache for compressed blocks.
+// If nil, rocksdb will not use a compressed block cache.
 // Default: nil
 func (self *BlockBasedTableOptions) SetBlockCacheCompressed(value *Cache) {
 	self.comp_cache = value
