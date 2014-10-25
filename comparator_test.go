@@ -1,10 +1,12 @@
-package gorocksdb
+package gorocksdb_test
 
 import (
 	"bytes"
-	. "github.com/smartystreets/goconvey/convey"
 	"os"
 	"testing"
+
+	. "github.com/rdallman/gorocksdb"
+	. "github.com/smartystreets/goconvey/convey"
 )
 
 type testComparator struct {

@@ -1,9 +1,10 @@
-package gorocksdb
+package gorocksdb_test
 
 import (
 	"os"
 	"testing"
 
+	. "github.com/rdallman/gorocksdb"
 	. "github.com/smartystreets/goconvey/convey"
 )
 
