@@ -113,3 +113,9 @@ func TestFixedPrefixTransform(t *testing.T) {
 		So(numFound, ShouldEqual, 3)
 	})
 }
+
+func TestSetPrefixExtractorDestroy(t *testing.T) {
+	o := NewDefaultOptions()
+	defer o.Destroy()
+	o.SetPrefixExtractor(&testSliceTransform{})
+}
