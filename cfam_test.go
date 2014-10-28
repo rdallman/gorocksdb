@@ -1,9 +1,11 @@
-package gorocksdb
+package gorocksdb_test
 
 import (
-	. "github.com/smartystreets/goconvey/convey"
 	"os"
 	"testing"
+
+	. "github.com/rdallman/gorocksdb"
+	. "github.com/smartystreets/goconvey/convey"
 )
 
 func TestColumnFamilies(t *testing.T) {
