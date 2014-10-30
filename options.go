@@ -892,12 +892,6 @@ func (self *Options) Destroy() {
 	if self.ccmp != nil {
 		C.rocksdb_comparator_destroy(self.ccmp)
 	}
-	if self.cmo != nil {
-		C.rocksdb_mergeoperator_destroy(self.cmo)
-	}
-	if self.cst != nil {
-		C.rocksdb_slicetransform_destroy(self.cst)
-	}
 	if self.ccf != nil {
 		C.rocksdb_compactionfilter_destroy(self.ccf)
 	}
