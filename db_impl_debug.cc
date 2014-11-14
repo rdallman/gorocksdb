@@ -13,14 +13,13 @@
 
 namespace rocksdb {
 
-void DBImpl::TEST_PurgeObsoleteteWAL() { PurgeObsoleteWALFiles(); }
-
 uint64_t DBImpl::TEST_GetLevel0TotalSize() {
   MutexLock l(&mutex_);
-  return default_cf_handle_->cfd()->current()->NumLevelBytes(0);
+  return default_cf_handle_->cfd()->current()->storage_info()->NumLevelBytes(0);
 }
 
-Iterator* DBImpl::TEST_NewInternalIterator(ColumnFamilyHandle* column_family) {
+Iterator* DBImpl::TEST_NewInternalIterator(Arena* arena,
+                                           ColumnFamilyHandle* column_family) {
   ColumnFamilyData* cfd;
   if (column_family == nullptr) {
     cfd = default_cf_handle_->cfd();
@@ -33,7 +32,7 @@ Iterator* DBImpl::TEST_NewInternalIterator(ColumnFamilyHandle* column_family) {
   SuperVersion* super_version = cfd->GetSuperVersion()->Ref();
   mutex_.Unlock();
   ReadOptions roptions;
-  return NewInternalIterator(roptions, cfd, super_version);
+  return NewInternalIterator(roptions, cfd, super_version, arena);
 }
 
 int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes(
@@ -46,7 +45,7 @@ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes(
     cfd = cfh->cfd();
   }
   MutexLock l(&mutex_);
-  return cfd->current()->MaxNextLevelOverlappingBytes();
+  return cfd->current()->storage_info()->MaxNextLevelOverlappingBytes();
 }
 
 void DBImpl::TEST_GetFilesMetaData(
@@ -57,7 +56,8 @@ void DBImpl::TEST_GetFilesMetaData(
   MutexLock l(&mutex_);
   metadata->resize(NumberLevels());
   for (int level = 0; level < NumberLevels(); level++) {
-    const std::vector<FileMetaData*>& files = cfd->current()->files_[level];
+    const std::vector<FileMetaData*>& files =
+        cfd->current()->storage_info()->LevelFiles(level);
 
     (*metadata)[level].clear();
     for (const auto& f : files) {
@@ -67,7 +67,7 @@ void DBImpl::TEST_GetFilesMetaData(
 }
 
 uint64_t DBImpl::TEST_Current_Manifest_FileNo() {
-  return versions_->ManifestFileNumber();
+  return versions_->manifest_file_number();
 }
 
 Status DBImpl::TEST_CompactRange(int level, const Slice* begin,
@@ -119,15 +119,26 @@ Status DBImpl::TEST_WaitForCompact() {
   return bg_error_;
 }
 
-Status DBImpl::TEST_ReadFirstRecord(const WalFileType type,
-                                    const uint64_t number,
-                                    SequenceNumber* sequence) {
-  return ReadFirstRecord(type, number, sequence);
+void DBImpl::TEST_LockMutex() {
+  mutex_.Lock();
 }
 
-Status DBImpl::TEST_ReadFirstLine(const std::string& fname,
-                                  SequenceNumber* sequence) {
-  return ReadFirstLine(fname, sequence);
+void DBImpl::TEST_UnlockMutex() {
+  mutex_.Unlock();
 }
+
+void* DBImpl::TEST_BeginWrite() {
+  auto w = new WriteThread::Writer(&mutex_);
+  Status s = write_thread_.EnterWriteThread(w, 0);
+  assert(s.ok() && !w->done);  // No timeout and nobody should do our job
+  return reinterpret_cast<void*>(w);
+}
+
+void DBImpl::TEST_EndWrite(void* w) {
+  auto writer = reinterpret_cast<WriteThread::Writer*>(w);
+  write_thread_.ExitWriteThread(writer, writer, Status::OK());
+  delete writer;
+}
+
 }  // namespace rocksdb
 #endif  // ROCKSDB_LITE

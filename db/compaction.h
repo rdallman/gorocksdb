@@ -10,6 +10,7 @@
 #pragma once
 #include "util/arena.h"
 #include "util/autovector.h"
+#include "util/mutable_cf_options.h"
 #include "db/version_set.h"
 
 namespace rocksdb {
@@ -27,6 +28,7 @@ struct CompactionInputFiles {
 
 class Version;
 class ColumnFamilyData;
+class VersionStorageInfo;
 
 // A Compaction encapsulates information about a compaction.
 class Compaction {
@@ -88,8 +90,8 @@ class Compaction {
     return &inputs_[compaction_input_level].files;
   }
 
-  // Returns the FileLevel of the specified compaction input level.
-  FileLevel* input_levels(int compaction_input_level) {
+  // Returns the LevelFilesBrief of the specified compaction input level.
+  LevelFilesBrief* input_levels(int compaction_input_level) {
     return &input_levels_[compaction_input_level];
   }
 
@@ -151,10 +153,16 @@ class Compaction {
   // Was this compaction triggered manually by the client?
   bool IsManualCompaction() { return is_manual_compaction_; }
 
+  // Return the MutableCFOptions that should be used throughout the compaction
+  // procedure
+  const MutableCFOptions* mutable_cf_options() { return &mutable_cf_options_; }
+
   // Returns the size in bytes that the output file should be preallocated to.
   // In level compaction, that is max_file_size_. In universal compaction, that
   // is the sum of all input file sizes.
-  uint64_t OutputFilePreallocationSize();
+  uint64_t OutputFilePreallocationSize(const MutableCFOptions& mutable_options);
+
+  void SetInputVersion(Version* input_version);
 
  private:
   friend class CompactionPicker;
@@ -162,7 +170,7 @@ class Compaction {
   friend class FIFOCompactionPicker;
   friend class LevelCompactionPicker;
 
-  Compaction(Version* input_version, int start_level, int out_level,
+  Compaction(int num_levels, int start_level, int out_level,
              uint64_t target_file_size, uint64_t max_grandparent_overlap_bytes,
              uint32_t output_path_id, CompressionType output_compression,
              bool seek_compaction = false, bool deletion_compaction = false);
@@ -171,6 +179,7 @@ class Compaction {
   const int output_level_;  // levels to which output files are stored
   uint64_t max_output_file_size_;
   uint64_t max_grandparent_overlap_bytes_;
+  MutableCFOptions mutable_cf_options_;
   Version* input_version_;
   VersionEdit* edit_;
   int number_levels_;
@@ -187,7 +196,7 @@ class Compaction {
   autovector<CompactionInputFiles> inputs_;
 
   // A copy of inputs_, organized more closely in memory
-  autovector<FileLevel, 2> input_levels_;
+  autovector<LevelFilesBrief, 2> input_levels_;
 
   // State used to check for number of of overlapping grandparent files
   // (grandparent == "output_level_ + 1")
@@ -224,7 +233,8 @@ class Compaction {
   // bottommost level.
   //
   // @see BottomMostLevel()
-  void SetupBottomMostLevel(bool is_manual);
+  void SetupBottomMostLevel(VersionStorageInfo* vstorage, bool is_manual,
+                            bool level0_only);
 
   // In case of compaction error, reset the nextIndex that is used
   // to pick up the next file to be compacted from files_by_size_

@@ -17,17 +17,17 @@ namespace rocksdb {
 FileIndexer::FileIndexer(const Comparator* ucmp)
     : num_levels_(0), ucmp_(ucmp), level_rb_(nullptr) {}
 
-uint32_t FileIndexer::NumLevelIndex() {
+uint32_t FileIndexer::NumLevelIndex() const {
   return next_level_index_.size();
 }
 
-uint32_t FileIndexer::LevelIndexSize(uint32_t level) {
+uint32_t FileIndexer::LevelIndexSize(uint32_t level) const {
   return next_level_index_[level].num_index;
 }
 
 void FileIndexer::GetNextLevelIndex(
     const uint32_t level, const uint32_t file_index, const int cmp_smallest,
-    const int cmp_largest, int32_t* left_bound, int32_t* right_bound) {
+    const int cmp_largest, int32_t* left_bound, int32_t* right_bound) const {
   assert(level > 0);
 
   // Last level, no hint
@@ -100,7 +100,7 @@ void FileIndexer::UpdateIndex(Arena* arena, const uint32_t num_levels,
     }
     IndexLevel& index_level = next_level_index_[level];
     index_level.num_index = upper_size;
-    char* mem = arena->AllocateAligned(upper_size * sizeof(IndexUnit));
+    mem = arena->AllocateAligned(upper_size * sizeof(IndexUnit));
     index_level.index_units = new (mem) IndexUnit[upper_size];
 
     CalculateLB(

@@ -814,12 +814,6 @@ func (self *Options) SetMinPartialMergeOperands(value uint32) {
 	C.rocksdb_options_set_min_partial_merge_operands(self.c, C.uint32_t(value))
 }
 
-// Allow RocksDB to use thread local storage to optimize performance.
-// Default: true
-func (self *Options) SetAllowThreadLocal(value bool) {
-	C.rocksdb_options_set_allow_thread_local(self.c, boolToChar(value))
-}
-
 // If enabled, then we should collect metrics about database operations.
 // Default: false
 func (self *Options) EnableStatistics() {

@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <algorithm>
 #include <set>
 #include <utility>
 #include <vector>
@@ -38,10 +39,10 @@ struct FileDescriptor {
 
   FileDescriptor() : FileDescriptor(0, 0, 0) {}
 
-  FileDescriptor(uint64_t number, uint32_t path_id, uint64_t file_size)
+  FileDescriptor(uint64_t number, uint32_t path_id, uint64_t _file_size)
       : table_reader(nullptr),
         packed_number_and_path_id(PackFileNumberAndPathId(number, path_id)),
-        file_size(file_size) {}
+        file_size(_file_size) {}
 
   FileDescriptor& operator=(const FileDescriptor& fd) {
     table_reader = fd.table_reader;
@@ -74,7 +75,7 @@ struct FileMetaData {
   // Stats for compensating deletion entries during compaction
 
   // File size compensated by deletion entry.
-  // This is updated in Version::UpdateTemporaryStats() first time when the
+  // This is updated in Version::UpdateAccumulatedStats() first time when the
   // file is created or loaded.  After it is updated, it is immutable.
   uint64_t compensated_file_size;
   uint64_t num_entries;            // the number of entries.
@@ -109,20 +110,16 @@ struct FdWithKeyRange {
         largest_key() {
   }
 
-  FdWithKeyRange(FileDescriptor fd,
-      Slice smallest_key, Slice largest_key)
-      : fd(fd),
-        smallest_key(smallest_key),
-        largest_key(largest_key) {
-  }
+  FdWithKeyRange(FileDescriptor _fd, Slice _smallest_key, Slice _largest_key)
+      : fd(_fd), smallest_key(_smallest_key), largest_key(_largest_key) {}
 };
 
 // Data structure to store an array of FdWithKeyRange in one level
 // Actual data is guaranteed to be stored closely
-struct FileLevel {
+struct LevelFilesBrief {
   size_t num_files;
   FdWithKeyRange* files;
-  FileLevel() {
+  LevelFilesBrief() {
     num_files = 0;
     files = nullptr;
   }
@@ -163,13 +160,13 @@ class VersionEdit {
   // Add the specified file at the specified number.
   // REQUIRES: This version has not been saved (see VersionSet::SaveTo)
   // REQUIRES: "smallest" and "largest" are smallest and largest keys in file
-  void AddFile(int level, uint64_t file, uint64_t file_size,
-               uint64_t file_path_id, const InternalKey& smallest,
+  void AddFile(int level, uint64_t file, uint64_t file_path_id,
+               uint64_t file_size, const InternalKey& smallest,
                const InternalKey& largest, const SequenceNumber& smallest_seqno,
                const SequenceNumber& largest_seqno) {
     assert(smallest_seqno <= largest_seqno);
     FileMetaData f;
-    f.fd = FileDescriptor(file, file_size, file_path_id);
+    f.fd = FileDescriptor(file, file_path_id, file_size);
     f.smallest = smallest;
     f.largest = largest;
     f.smallest_seqno = smallest_seqno;
@@ -212,16 +209,22 @@ class VersionEdit {
     is_column_family_drop_ = true;
   }
 
-  void EncodeTo(std::string* dst) const;
+  // return true on success.
+  bool EncodeTo(std::string* dst) const;
   Status DecodeFrom(const Slice& src);
+
+  typedef std::set<std::pair<int, uint64_t>> DeletedFileSet;
+
+  const DeletedFileSet& GetDeletedFiles() { return deleted_files_; }
+  const std::vector<std::pair<int, FileMetaData>>& GetNewFiles() {
+    return new_files_;
+  }
 
   std::string DebugString(bool hex_key = false) const;
 
  private:
   friend class VersionSet;
   friend class Version;
-
-  typedef std::set< std::pair<int, uint64_t>> DeletedFileSet;
 
   bool GetLevel(Slice* input, int* level, const char** msg);
 

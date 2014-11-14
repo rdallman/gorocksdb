@@ -143,8 +143,8 @@ class BlockPrefixIndex::Builder {
         auto current = prefixes_per_bucket[i];
         // populate block ids from largest to smallest
         while (current != nullptr) {
-          for (uint32_t i = 0; i < current->num_blocks; i++) {
-            *last_block = current->end_block - i;
+          for (uint32_t iter = 0; iter < current->num_blocks; iter++) {
+            *last_block = current->end_block - iter;
             last_block--;
           }
           current = current->next;
@@ -210,8 +210,8 @@ Status BlockPrefixIndex::Create(const SliceTransform* internal_prefix_extractor,
   return s;
 }
 
-const uint32_t BlockPrefixIndex::GetBlocks(const Slice& key,
-                                           uint32_t** blocks) {
+uint32_t BlockPrefixIndex::GetBlocks(const Slice& key,
+                                     uint32_t** blocks) {
   Slice prefix = internal_prefix_extractor_->Transform(key);
 
   uint32_t bucket = PrefixToBucket(prefix, num_buckets_);

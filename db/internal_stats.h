@@ -36,6 +36,8 @@ enum DBPropertyType : uint32_t {
   kCompactionPending,      // Return 1 if a compaction is pending. Otherwise 0.
   kBackgroundErrors,       // Return accumulated background errors encountered.
   kCurSizeActiveMemTable,  // Return current size of the active memtable
+  kCurSizeAllMemTables,    // Return current size of all (active + immutable)
+                           // memtables
   kNumEntriesInMutableMemtable,    // Return number of entries in the mutable
                                    // memtable.
   kNumEntriesInImmutableMemtable,  // Return sum of number of entries in all
@@ -65,6 +67,7 @@ class InternalStats {
     WAL_FILE_BYTES,
     WAL_FILE_SYNCED,
     BYTES_WRITTEN,
+    NUMBER_KEYS_WRITTEN,
     WRITE_DONE_BY_OTHER,
     WRITE_DONE_BY_SELF,
     WRITE_WITH_WAL,
@@ -123,10 +126,17 @@ class InternalStats {
     // Files written during compaction between levels N and N+1
     int files_out_levelnp1;
 
+    // Total incoming entries during compaction between levels N and N+1
+    uint64_t num_input_records;
+
+    // Accumulated diff number of entries
+    // (num input entries - num output entires) for compaction  levels N and N+1
+    uint64_t num_dropped_records;
+
     // Number of compactions done
     int count;
 
-    explicit CompactionStats(int count = 0)
+    explicit CompactionStats(int _count = 0)
         : micros(0),
           bytes_readn(0),
           bytes_readnp1(0),
@@ -134,7 +144,9 @@ class InternalStats {
           files_in_leveln(0),
           files_in_levelnp1(0),
           files_out_levelnp1(0),
-          count(count) {}
+          num_input_records(0),
+          num_dropped_records(0),
+          count(_count) {}
 
     explicit CompactionStats(const CompactionStats& c)
         : micros(c.micros),
@@ -144,6 +156,8 @@ class InternalStats {
           files_in_leveln(c.files_in_leveln),
           files_in_levelnp1(c.files_in_levelnp1),
           files_out_levelnp1(c.files_out_levelnp1),
+          num_input_records(c.num_input_records),
+          num_dropped_records(c.num_dropped_records),
           count(c.count) {}
 
     void Add(const CompactionStats& c) {
@@ -154,6 +168,8 @@ class InternalStats {
       this->files_in_leveln += c.files_in_leveln;
       this->files_in_levelnp1 += c.files_in_levelnp1;
       this->files_out_levelnp1 += c.files_out_levelnp1;
+      this->num_input_records += c.num_input_records;
+      this->num_dropped_records += c.num_dropped_records;
       this->count += c.count;
     }
 
@@ -165,6 +181,8 @@ class InternalStats {
       this->files_in_leveln -= c.files_in_leveln;
       this->files_in_levelnp1 -= c.files_in_levelnp1;
       this->files_out_levelnp1 -= c.files_out_levelnp1;
+      this->num_input_records -= c.num_input_records;
+      this->num_dropped_records -= c.num_dropped_records;
       this->count -= c.count;
     }
   };
@@ -247,6 +265,11 @@ class InternalStats {
     // another thread.
     uint64_t write_other;
     uint64_t write_self;
+    // Total number of keys written. write_self and write_other measure number
+    // of write requests written, Each of the write request can contain updates
+    // to multiple keys. num_keys_written is total number of keys updated by all
+    // those writes.
+    uint64_t num_keys_written;
     double seconds_up;
 
     DBStatsSnapshot()
@@ -256,6 +279,7 @@ class InternalStats {
           write_with_wal(0),
           write_other(0),
           write_self(0),
+          num_keys_written(0),
           seconds_up(0) {}
   } db_stats_snapshot_;
 

@@ -10,14 +10,18 @@
 #pragma once
 #include <string>
 #include <memory>
+#include <functional>
 #include <deque>
+#include <vector>
 #include "db/dbformat.h"
 #include "db/skiplist.h"
 #include "db/version_edit.h"
 #include "rocksdb/db.h"
 #include "rocksdb/memtablerep.h"
+#include "rocksdb/immutable_options.h"
 #include "util/arena.h"
 #include "util/dynamic_bloom.h"
+#include "util/mutable_cf_options.h"
 
 namespace rocksdb {
 
@@ -25,6 +29,28 @@ class Arena;
 class Mutex;
 class MemTableIterator;
 class MergeContext;
+
+struct MemTableOptions {
+  explicit MemTableOptions(
+      const ImmutableCFOptions& ioptions,
+      const MutableCFOptions& mutable_cf_options);
+  size_t write_buffer_size;
+  size_t arena_block_size;
+  uint32_t memtable_prefix_bloom_bits;
+  uint32_t memtable_prefix_bloom_probes;
+  size_t memtable_prefix_bloom_huge_page_tlb_size;
+  bool inplace_update_support;
+  size_t inplace_update_num_locks;
+  UpdateStatus (*inplace_callback)(char* existing_value,
+                                   uint32_t* existing_value_size,
+                                   Slice delta_value,
+                                   std::string* merged_value);
+  size_t max_successive_merges;
+  bool filter_deletes;
+  Statistics* statistics;
+  MergeOperator* merge_operator;
+  Logger* info_log;
+};
 
 class MemTable {
  public:
@@ -40,7 +66,8 @@ class MemTable {
   // MemTables are reference counted.  The initial reference count
   // is zero and the caller must call Ref() at least once.
   explicit MemTable(const InternalKeyComparator& comparator,
-                    const Options& options);
+                    const ImmutableCFOptions& ioptions,
+                    const MutableCFOptions& mutable_cf_options);
 
   ~MemTable();
 
@@ -67,7 +94,11 @@ class MemTable {
 
   // This method heuristically determines if the memtable should continue to
   // host more data.
-  bool ShouldFlush() const { return should_flush_; }
+  bool ShouldScheduleFlush() const {
+    return flush_scheduled_ == false && should_flush_;
+  }
+
+  void MarkFlushScheduled() { flush_scheduled_ = true; }
 
   // Return an iterator that yields the contents of the memtable.
   //
@@ -81,8 +112,7 @@ class MemTable {
   // arena: If not null, the arena needs to be used to allocate the Iterator.
   //        Calling ~Iterator of the iterator will destroy all the states but
   //        those allocated in arena.
-  Iterator* NewIterator(const ReadOptions& options,
-                        Arena* arena = nullptr);
+  Iterator* NewIterator(const ReadOptions& read_options, Arena* arena);
 
   // Add an entry into memtable that maps key to value at the
   // specified sequence number and with the specified type.
@@ -100,7 +130,7 @@ class MemTable {
   //   store MergeInProgress in s, and return false.
   // Else, return false.
   bool Get(const LookupKey& key, std::string* value, Status* s,
-           MergeContext& merge_context, const Options& options);
+           MergeContext* merge_context);
 
   // Attempts to update the new_value inplace, else does normal Add
   // Pseudocode
@@ -124,8 +154,7 @@ class MemTable {
   //   else return false
   bool UpdateCallback(SequenceNumber seq,
                       const Slice& key,
-                      const Slice& delta,
-                      const Options& options);
+                      const Slice& delta);
 
   // Returns the number of successive merge entries starting from the newest
   // entry for the key up to the last non-merge entry or last entry for the
@@ -137,6 +166,9 @@ class MemTable {
 
   // Returns the edits area that is needed for flushing the memtable
   VersionEdit* GetEdits() { return &edit_; }
+
+  // Returns if there is no entry inserted to the mem table.
+  bool IsEmpty() const { return first_seqno_ == 0; }
 
   // Returns the sequence number of the first element that was inserted
   // into the memtable
@@ -170,8 +202,10 @@ class MemTable {
 
   const Arena& TEST_GetArena() const { return arena_; }
 
+  const MemTableOptions* GetMemTableOptions() const { return &moptions_; }
+
  private:
-  // Dynamically check if we can add more incoming entries.
+  // Dynamically check if we can add more incoming entries
   bool ShouldFlushNow() const;
 
   friend class MemTableIterator;
@@ -179,9 +213,9 @@ class MemTable {
   friend class MemTableList;
 
   KeyComparator comparator_;
+  const MemTableOptions moptions_;
   int refs_;
   const size_t kArenaBlockSize;
-  const size_t kWriteBufferSize;
   Arena arena_;
   unique_ptr<MemTableRep> table_;
 
@@ -214,6 +248,9 @@ class MemTable {
 
   // a flag indicating if a memtable has met the criteria to flush
   bool should_flush_;
+
+  // a flag indicating if flush has been scheduled
+  bool flush_scheduled_;
 };
 
 extern const char* EncodeKey(std::string* scratch, const Slice& target);

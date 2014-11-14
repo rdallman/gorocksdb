@@ -23,7 +23,6 @@
 //    data: uint8[len]
 
 #include "rocksdb/write_batch.h"
-#include "rocksdb/options.h"
 #include "rocksdb/merge_operator.h"
 #include "db/dbformat.h"
 #include "db/db_impl.h"
@@ -350,14 +349,14 @@ class MemTableInserter : public WriteBatch::Handler {
       return seek_status;
     }
     MemTable* mem = cf_mems_->GetMemTable();
-    const Options* options = cf_mems_->GetOptions();
-    if (!options->inplace_update_support) {
+    auto* moptions = mem->GetMemTableOptions();
+    if (!moptions->inplace_update_support) {
       mem->Add(sequence_, kTypeValue, key, value);
-    } else if (options->inplace_callback == nullptr) {
+    } else if (moptions->inplace_callback == nullptr) {
       mem->Update(sequence_, key, value);
-      RecordTick(options->statistics.get(), NUMBER_KEYS_UPDATED);
+      RecordTick(moptions->statistics, NUMBER_KEYS_UPDATED);
     } else {
-      if (mem->UpdateCallback(sequence_, key, value, *options)) {
+      if (mem->UpdateCallback(sequence_, key, value)) {
       } else {
         // key not found in memtable. Do sst get, update, add
         SnapshotImpl read_from_snapshot;
@@ -376,17 +375,17 @@ class MemTableInserter : public WriteBatch::Handler {
 
         char* prev_buffer = const_cast<char*>(prev_value.c_str());
         uint32_t prev_size = prev_value.size();
-        auto status = options->inplace_callback(s.ok() ? prev_buffer : nullptr,
-                                                s.ok() ? &prev_size : nullptr,
-                                                value, &merged_value);
+        auto status = moptions->inplace_callback(s.ok() ? prev_buffer : nullptr,
+                                                 s.ok() ? &prev_size : nullptr,
+                                                 value, &merged_value);
         if (status == UpdateStatus::UPDATED_INPLACE) {
           // prev_value is updated in-place with final value.
           mem->Add(sequence_, kTypeValue, key, Slice(prev_buffer, prev_size));
-          RecordTick(options->statistics.get(), NUMBER_KEYS_WRITTEN);
+          RecordTick(moptions->statistics, NUMBER_KEYS_WRITTEN);
         } else if (status == UpdateStatus::UPDATED) {
           // merged_value contains the final value.
           mem->Add(sequence_, kTypeValue, key, Slice(merged_value));
-          RecordTick(options->statistics.get(), NUMBER_KEYS_WRITTEN);
+          RecordTick(moptions->statistics, NUMBER_KEYS_WRITTEN);
         }
       }
     }
@@ -394,6 +393,7 @@ class MemTableInserter : public WriteBatch::Handler {
     // sequence number. Even if the update eventually fails and does not result
     // in memtable add/update.
     sequence_++;
+    cf_mems_->CheckMemtableFull();
     return Status::OK();
   }
 
@@ -405,17 +405,17 @@ class MemTableInserter : public WriteBatch::Handler {
       return seek_status;
     }
     MemTable* mem = cf_mems_->GetMemTable();
-    const Options* options = cf_mems_->GetOptions();
+    auto* moptions = mem->GetMemTableOptions();
     bool perform_merge = false;
 
-    if (options->max_successive_merges > 0 && db_ != nullptr) {
+    if (moptions->max_successive_merges > 0 && db_ != nullptr) {
       LookupKey lkey(key, sequence_);
 
       // Count the number of successive merges at the head
       // of the key in the memtable
       size_t num_merges = mem->CountSuccessiveMergeEntries(lkey);
 
-      if (num_merges >= options->max_successive_merges) {
+      if (num_merges >= moptions->max_successive_merges) {
         perform_merge = true;
       }
     }
@@ -439,16 +439,16 @@ class MemTableInserter : public WriteBatch::Handler {
       Slice get_value_slice = Slice(get_value);
 
       // 2) Apply this merge
-      auto merge_operator = options->merge_operator.get();
+      auto merge_operator = moptions->merge_operator;
       assert(merge_operator);
 
       std::deque<std::string> operands;
       operands.push_front(value.ToString());
       std::string new_value;
       if (!merge_operator->FullMerge(key, &get_value_slice, operands,
-                                     &new_value, options->info_log.get())) {
+                                     &new_value, moptions->info_log)) {
           // Failed to merge!
-        RecordTick(options->statistics.get(), NUMBER_MERGE_FAILURES);
+        RecordTick(moptions->statistics, NUMBER_MERGE_FAILURES);
 
         // Store the delta in memtable
         perform_merge = false;
@@ -464,6 +464,7 @@ class MemTableInserter : public WriteBatch::Handler {
     }
 
     sequence_++;
+    cf_mems_->CheckMemtableFull();
     return Status::OK();
   }
 
@@ -474,8 +475,8 @@ class MemTableInserter : public WriteBatch::Handler {
       return seek_status;
     }
     MemTable* mem = cf_mems_->GetMemTable();
-    const Options* options = cf_mems_->GetOptions();
-    if (!dont_filter_deletes_ && options->filter_deletes) {
+    auto* moptions = mem->GetMemTableOptions();
+    if (!dont_filter_deletes_ && moptions->filter_deletes) {
       SnapshotImpl read_from_snapshot;
       read_from_snapshot.number_ = sequence_;
       ReadOptions ropts;
@@ -486,12 +487,13 @@ class MemTableInserter : public WriteBatch::Handler {
         cf_handle = db_->DefaultColumnFamily();
       }
       if (!db_->KeyMayExist(ropts, cf_handle, key, &value)) {
-        RecordTick(options->statistics.get(), NUMBER_FILTERED_DELETES);
+        RecordTick(moptions->statistics, NUMBER_FILTERED_DELETES);
         return Status::OK();
       }
     }
     mem->Add(sequence_, kTypeDeletion, key, Slice());
     sequence_++;
+    cf_mems_->CheckMemtableFull();
     return Status::OK();
   }
 };

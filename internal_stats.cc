@@ -7,7 +7,11 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "db/internal_stats.h"
+
+#ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
+#endif
+
 #include <inttypes.h>
 #include <vector>
 #include "db/column_family.h"
@@ -26,7 +30,7 @@ void PrintLevelStatsHeader(char* buf, size_t len, const std::string& cf_name) {
       "Level   Files   Size(MB) Score Read(GB)  Rn(GB) Rnp1(GB) "
       "Write(GB) Wnew(GB) RW-Amp W-Amp Rd(MB/s) Wr(MB/s)  Rn(cnt) "
       "Rnp1(cnt) Wnp1(cnt) Wnew(cnt)  Comp(sec) Comp(cnt) Avg(sec) "
-      "Stall(sec) Stall(cnt) Avg(ms)\n"
+      "Stall(sec) Stall(cnt) Avg(ms)     RecordIn   RecordDrop\n"
       "--------------------------------------------------------------------"
       "--------------------------------------------------------------------"
       "--------------------------------------------------------------------\n",
@@ -42,46 +46,42 @@ void PrintLevelStats(char* buf, size_t len, const std::string& name,
   double elapsed = (stats.micros + 1) / 1000000.0;
 
   snprintf(buf, len,
-    "%4s %5d/%-3d %8.0f %5.1f " /* Level, Files, Size(MB), Score */
-    "%8.1f " /* Read(GB) */
-    "%7.1f " /* Rn(GB) */
-    "%8.1f " /* Rnp1(GB) */
-    "%9.1f " /* Write(GB) */
-    "%8.1f " /* Wnew(GB) */
-    "%6.1f " /* RW-Amp */
-    "%5.1f " /* W-Amp */
-    "%8.1f " /* Rd(MB/s) */
-    "%8.1f " /* Wr(MB/s) */
-    "%8d " /* Rn(cnt) */
-    "%9d " /* Rnp1(cnt) */
-    "%9d " /* Wnp1(cnt) */
-    "%9d " /* Wnew(cnt) */
-    "%10.0f " /* Comp(sec) */
-    "%9d " /* Comp(cnt) */
-    "%8.3f " /* Avg(sec) */
-    "%10.2f " /* Stall(sec) */
-    "%10" PRIu64 " " /* Stall(cnt) */
-    "%7.2f\n" /* Avg(ms) */,
-    name.c_str(), num_files, being_compacted, total_file_size / kMB, score,
-    bytes_read / kGB,
-    stats.bytes_readn / kGB,
-    stats.bytes_readnp1 / kGB,
-    stats.bytes_written / kGB,
-    bytes_new / kGB,
-    rw_amp,
-    w_amp,
-    bytes_read / kMB / elapsed,
-    stats.bytes_written / kMB / elapsed,
-    stats.files_in_leveln,
-    stats.files_in_levelnp1,
-    stats.files_out_levelnp1,
-    stats.files_out_levelnp1 - stats.files_in_levelnp1,
-    stats.micros / 1000000.0,
-    stats.count,
-    stats.count == 0 ? 0 : stats.micros / 1000000.0 / stats.count,
-    stall_us / 1000000.0,
-    stalls,
-    stalls == 0 ? 0 : stall_us / 1000.0 / stalls);
+           "%4s %5d/%-3d %8.0f %5.1f " /* Level, Files, Size(MB), Score */
+           "%8.1f "                    /* Read(GB) */
+           "%7.1f "                    /* Rn(GB) */
+           "%8.1f "                    /* Rnp1(GB) */
+           "%9.1f "                    /* Write(GB) */
+           "%8.1f "                    /* Wnew(GB) */
+           "%6.1f "                    /* RW-Amp */
+           "%5.1f "                    /* W-Amp */
+           "%8.1f "                    /* Rd(MB/s) */
+           "%8.1f "                    /* Wr(MB/s) */
+           "%8d "                      /* Rn(cnt) */
+           "%9d "                      /* Rnp1(cnt) */
+           "%9d "                      /* Wnp1(cnt) */
+           "%9d "                      /* Wnew(cnt) */
+           "%10.0f "                   /* Comp(sec) */
+           "%9d "                      /* Comp(cnt) */
+           "%8.3f "                    /* Avg(sec) */
+           "%10.2f "                   /* Stall(sec) */
+           "%10" PRIu64
+           " "      /* Stall(cnt) */
+           "%7.2f " /* Avg(ms) */
+           "%12" PRIu64
+           " " /* input entries */
+           "%12" PRIu64 "\n" /* number of records reduced */,
+           name.c_str(), num_files, being_compacted, total_file_size / kMB,
+           score, bytes_read / kGB, stats.bytes_readn / kGB,
+           stats.bytes_readnp1 / kGB, stats.bytes_written / kGB,
+           bytes_new / kGB, rw_amp, w_amp, bytes_read / kMB / elapsed,
+           stats.bytes_written / kMB / elapsed, stats.files_in_leveln,
+           stats.files_in_levelnp1, stats.files_out_levelnp1,
+           stats.files_out_levelnp1 - stats.files_in_levelnp1,
+           stats.micros / 1000000.0, stats.count,
+           stats.count == 0 ? 0 : stats.micros / 1000000.0 / stats.count,
+           stall_us / 1000000.0, stalls,
+           stalls == 0 ? 0 : stall_us / 1000.0 / stalls,
+           stats.num_input_records, stats.num_dropped_records);
 }
 
 
@@ -125,6 +125,8 @@ DBPropertyType GetPropertyType(const Slice& property, bool* is_int_property,
     return kBackgroundErrors;
   } else if (in == "cur-size-active-mem-table") {
     return kCurSizeActiveMemTable;
+  } else if (in == "cur-size-all-mem-tables") {
+    return kCurSizeAllMemTables;
   } else if (in == "num-entries-active-mem-table") {
     return kNumEntriesInMutableMemtable;
   } else if (in == "num-entries-imm-mem-tables") {
@@ -159,7 +161,8 @@ bool InternalStats::GetStringProperty(DBPropertyType property_type,
                                       const Slice& property,
                                       std::string* value) {
   assert(value != nullptr);
-  Version* current = cfd_->current();
+  auto* current = cfd_->current();
+  const auto* vstorage = current->storage_info();
   Slice in = property;
 
   switch (property_type) {
@@ -172,7 +175,7 @@ bool InternalStats::GetStringProperty(DBPropertyType property_type,
       } else {
         char buf[100];
         snprintf(buf, sizeof(buf), "%d",
-                 current->NumLevelFiles(static_cast<int>(level)));
+                 vstorage->NumLevelFiles(static_cast<int>(level)));
         *value = buf;
         return true;
       }
@@ -186,8 +189,8 @@ bool InternalStats::GetStringProperty(DBPropertyType property_type,
 
       for (int level = 0; level < number_levels_; level++) {
         snprintf(buf, sizeof(buf), "%3d %8d %8.0f\n", level,
-                 current->NumLevelFiles(level),
-                 current->NumLevelBytes(level) / kMB);
+                 vstorage->NumLevelFiles(level),
+                 vstorage->NumLevelBytes(level) / kMB);
         value->append(buf);
       }
       return true;
@@ -219,7 +222,7 @@ bool InternalStats::GetStringProperty(DBPropertyType property_type,
 
 bool InternalStats::GetIntProperty(DBPropertyType property_type,
                                    uint64_t* value, DBImpl* db) const {
-  Version* current = cfd_->current();
+  const auto* vstorage = cfd_->current()->storage_info();
 
   switch (property_type) {
     case kNumImmutableMemTable:
@@ -232,7 +235,7 @@ bool InternalStats::GetIntProperty(DBPropertyType property_type,
     case kCompactionPending:
       // 1 if the system already determines at least one compacdtion is needed.
       // 0 otherwise,
-      *value = (current->NeedsCompaction() ? 1 : 0);
+      *value = (vstorage->NeedsCompaction() ? 1 : 0);
       return true;
     case kBackgroundErrors:
       // Accumulated number of  errors in background flushes or compactions.
@@ -242,12 +245,17 @@ bool InternalStats::GetIntProperty(DBPropertyType property_type,
       // Current size of the active memtable
       *value = cfd_->mem()->ApproximateMemoryUsage();
       return true;
+    case kCurSizeAllMemTables:
+      // Current size of the active memtable + immutable memtables
+      *value = cfd_->mem()->ApproximateMemoryUsage() +
+               cfd_->imm()->ApproximateMemoryUsage();
+      return true;
     case kNumEntriesInMutableMemtable:
-      // Current size of the active memtable
+      // Current number of entires in the active memtable
       *value = cfd_->mem()->GetNumEntries();
       return true;
     case kNumEntriesInImmutableMemtable:
-      // Current size of the active memtable
+      // Current number of entries in the immutable memtables
       *value = cfd_->imm()->current()->GetTotalNumEntries();
       return true;
     case kEstimatedNumKeys:
@@ -255,7 +263,7 @@ bool InternalStats::GetIntProperty(DBPropertyType property_type,
       // Use estimated entries in tables + total entries in memtables.
       *value = cfd_->mem()->GetNumEntries() +
                cfd_->imm()->current()->GetTotalNumEntries() +
-               current->GetEstimatedActiveKeys();
+               vstorage->GetEstimatedActiveKeys();
       return true;
 #ifndef ROCKSDB_LITE
     case kIsFileDeletionEnabled:
@@ -278,16 +286,25 @@ void InternalStats::DumpDBStats(std::string* value) {
   value->append(buf);
   // Cumulative
   uint64_t user_bytes_written = db_stats_[InternalStats::BYTES_WRITTEN];
+  uint64_t num_keys_written = db_stats_[InternalStats::NUMBER_KEYS_WRITTEN];
   uint64_t write_other = db_stats_[InternalStats::WRITE_DONE_BY_OTHER];
   uint64_t write_self = db_stats_[InternalStats::WRITE_DONE_BY_SELF];
   uint64_t wal_bytes = db_stats_[InternalStats::WAL_FILE_BYTES];
   uint64_t wal_synced = db_stats_[InternalStats::WAL_FILE_SYNCED];
   uint64_t write_with_wal = db_stats_[InternalStats::WRITE_WITH_WAL];
   // Data
+  // writes: total number of write requests.
+  // keys: total number of key updates issued by all the write requests
+  // batches: number of group commits issued to the DB. Each group can contain
+  //          one or more writes.
+  // so writes/keys is the average number of put in multi-put or put
+  // writes/batches is the average group commit size.
+  //
+  // The format is the same for interval stats.
   snprintf(buf, sizeof(buf),
-           "Cumulative writes: %" PRIu64 " writes, %" PRIu64 " batches, "
-           "%.1f writes per batch, %.2f GB user ingest\n",
-           write_other + write_self, write_self,
+           "Cumulative writes: %" PRIu64 " writes, %" PRIu64 " keys, %" PRIu64
+           " batches, %.1f writes per batch, %.2f GB user ingest\n",
+           write_other + write_self, num_keys_written, write_self,
            (write_other + write_self) / static_cast<double>(write_self + 1),
            user_bytes_written / kGB);
   value->append(buf);
@@ -303,11 +320,13 @@ void InternalStats::DumpDBStats(std::string* value) {
   // Interval
   uint64_t interval_write_other = write_other - db_stats_snapshot_.write_other;
   uint64_t interval_write_self = write_self - db_stats_snapshot_.write_self;
+  uint64_t interval_num_keys_written =
+      num_keys_written - db_stats_snapshot_.num_keys_written;
   snprintf(buf, sizeof(buf),
-           "Interval writes: %" PRIu64 " writes, %" PRIu64 " batches, "
-           "%.1f writes per batch, %.1f MB user ingest\n",
+           "Interval writes: %" PRIu64 " writes, %" PRIu64 " keys, %" PRIu64
+           " batches, %.1f writes per batch, %.1f MB user ingest\n",
            interval_write_other + interval_write_self,
-           interval_write_self,
+           interval_num_keys_written, interval_write_self,
            static_cast<double>(interval_write_other + interval_write_self) /
                (interval_write_self + 1),
            (user_bytes_written - db_stats_snapshot_.ingest_bytes) / kMB);
@@ -332,30 +351,32 @@ void InternalStats::DumpDBStats(std::string* value) {
   db_stats_snapshot_.ingest_bytes = user_bytes_written;
   db_stats_snapshot_.write_other = write_other;
   db_stats_snapshot_.write_self = write_self;
+  db_stats_snapshot_.num_keys_written = num_keys_written;
   db_stats_snapshot_.wal_bytes = wal_bytes;
   db_stats_snapshot_.wal_synced = wal_synced;
   db_stats_snapshot_.write_with_wal = write_with_wal;
 }
 
 void InternalStats::DumpCFStats(std::string* value) {
-  Version* current = cfd_->current();
+  const VersionStorageInfo* vstorage = cfd_->current()->storage_info();
 
   int num_levels_to_check =
       (cfd_->options()->compaction_style != kCompactionStyleUniversal &&
        cfd_->options()->compaction_style != kCompactionStyleFIFO)
-          ? current->NumberLevels() - 1
+          ? vstorage->num_levels() - 1
           : 1;
+
   // Compaction scores are sorted base on its value. Restore them to the
   // level order
   std::vector<double> compaction_score(number_levels_, 0);
   for (int i = 0; i < num_levels_to_check; ++i) {
-    compaction_score[current->compaction_level_[i]] =
-      current->compaction_score_[i];
+    compaction_score[vstorage->CompactionScoreLevel(i)] =
+        vstorage->CompactionScore(i);
   }
   // Count # of files being compacted for each level
   std::vector<int> files_being_compacted(number_levels_, 0);
   for (int level = 0; level < num_levels_to_check; ++level) {
-    for (auto* f : current->files_[level]) {
+    for (auto* f : vstorage->LevelFiles(level)) {
       if (f->being_compacted) {
         ++files_being_compacted[level];
       }
@@ -378,7 +399,7 @@ void InternalStats::DumpCFStats(std::string* value) {
   uint64_t total_stall_count = 0;
   double total_stall_us = 0;
   for (int level = 0; level < number_levels_; level++) {
-    int files = current->NumLevelFiles(level);
+    int files = vstorage->NumLevelFiles(level);
     total_files += files;
     total_files_being_compacted += files_being_compacted[level];
     if (comp_stats_[level].micros > 0 || files > 0) {
@@ -397,7 +418,7 @@ void InternalStats::DumpCFStats(std::string* value) {
             stall_leveln_slowdown_hard_[level]);
 
       stats_sum.Add(comp_stats_[level]);
-      total_file_size += current->NumLevelBytes(level);
+      total_file_size += vstorage->NumLevelBytes(level);
       total_stall_us += stall_us;
       total_stall_count += stalls;
       total_slowdown_soft += stall_leveln_slowdown_soft_[level];
@@ -412,10 +433,10 @@ void InternalStats::DumpCFStats(std::string* value) {
       double w_amp = (comp_stats_[level].bytes_readn == 0) ? 0.0
           : comp_stats_[level].bytes_written /
             static_cast<double>(comp_stats_[level].bytes_readn);
-      PrintLevelStats(buf, sizeof(buf), "L" + std::to_string(level),
-          files, files_being_compacted[level], current->NumLevelBytes(level),
-          compaction_score[level], rw_amp, w_amp, stall_us, stalls,
-          comp_stats_[level]);
+      PrintLevelStats(buf, sizeof(buf), "L" + std::to_string(level), files,
+                      files_being_compacted[level],
+                      vstorage->NumLevelBytes(level), compaction_score[level],
+                      rw_amp, w_amp, stall_us, stalls, comp_stats_[level]);
       value->append(buf);
     }
   }

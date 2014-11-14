@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <chrono>
 #include <deque>
 #include <set>
 #include <dirent.h>
@@ -736,14 +737,29 @@ class PosixWritableFile : public WritableFile {
     GetPreallocationStatus(&block_size, &last_allocated_block);
     if (last_allocated_block > 0) {
       // trim the extra space preallocated at the end of the file
+      // NOTE(ljin): we probably don't want to surface failure as an IOError,
+      // but it will be nice to log these errors.
       int dummy __attribute__((unused));
-      dummy = ftruncate(fd_, filesize_);  // ignore errors
+      dummy = ftruncate(fd_, filesize_);
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+      // in some file systems, ftruncate only trims trailing space if the
+      // new file size is smaller than the current size. Calling fallocate
+      // with FALLOC_FL_PUNCH_HOLE flag to explicitly release these unused
+      // blocks. FALLOC_FL_PUNCH_HOLE is supported on at least the following
+      // filesystems:
+      //   XFS (since Linux 2.6.38)
+      //   ext4 (since Linux 3.0)
+      //   Btrfs (since Linux 3.7)
+      //   tmpfs (since Linux 3.5)
+      // We ignore error since failure of this operation does not affect
+      // correctness.
+      fallocate(fd_, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+                filesize_, block_size * last_allocated_block - filesize_);
+#endif
     }
 
     if (close(fd_) < 0) {
-      if (s.ok()) {
-        s = IOError(filename_, errno);
-      }
+      s = IOError(filename_, errno);
     }
     fd_ = -1;
     return s;
@@ -1350,25 +1366,13 @@ class PosixEnv : public Env {
   }
 
   virtual uint64_t NowMicros() {
-    struct timeval tv;
-    // TODO(kailiu) MAC DON'T HAVE THIS
-    gettimeofday(&tv, nullptr);
-    return static_cast<uint64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
   }
 
   virtual uint64_t NowNanos() {
-#ifdef OS_LINUX
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
-#elif __MACH__
-    clock_serv_t cclock;
-    mach_timespec_t ts;
-    host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
-    clock_get_time(cclock, &ts);
-    mach_port_deallocate(mach_task_self(), cclock);
-#endif
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
   }
 
   virtual void SleepForMicroseconds(int micros) {
@@ -1416,6 +1420,12 @@ class PosixEnv : public Env {
   virtual void SetBackgroundThreads(int num, Priority pri) {
     assert(pri >= Priority::LOW && pri <= Priority::HIGH);
     thread_pools_[pri].SetBackgroundThreads(num);
+  }
+
+  // Allow increasing the number of worker threads.
+  virtual void IncBackgroundThreadsIfNeeded(int num, Priority pri) {
+    assert(pri >= Priority::LOW && pri <= Priority::HIGH);
+    thread_pools_[pri].IncBackgroundThreadsIfNeeded(num);
   }
 
   virtual void LowerThreadPoolIOPriority(Priority pool = LOW) override {
@@ -1638,19 +1648,28 @@ class PosixEnv : public Env {
       PthreadCall("signalall", pthread_cond_broadcast(&bgsignal_));
     }
 
-    void SetBackgroundThreads(int num) {
+    void SetBackgroundThreadsInternal(int num, bool allow_reduce) {
       PthreadCall("lock", pthread_mutex_lock(&mu_));
       if (exit_all_threads_) {
         PthreadCall("unlock", pthread_mutex_unlock(&mu_));
         return;
       }
-      if (num != total_threads_limit_) {
+      if (num > total_threads_limit_ ||
+          (num < total_threads_limit_ && allow_reduce)) {
         total_threads_limit_ = num;
         WakeUpAllThreads();
         StartBGThreads();
       }
       assert(total_threads_limit_ > 0);
       PthreadCall("unlock", pthread_mutex_unlock(&mu_));
+    }
+
+    void IncBackgroundThreadsIfNeeded(int num) {
+      SetBackgroundThreadsInternal(num, false);
+    }
+
+    void SetBackgroundThreads(int num) {
+      SetBackgroundThreadsInternal(num, true);
     }
 
     void StartBGThreads() {
