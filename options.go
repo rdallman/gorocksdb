@@ -276,6 +276,16 @@ func (self *Options) SetMaxOpenFiles(value int) {
 	C.rocksdb_options_set_max_open_files(self.c, C.int(value))
 }
 
+// Once write-ahead logs exceed this size, we will start forcing the flush of
+// column families whose memtables are backed by the oldest live WAL file
+// (i.e. the ones that are causing all the space amplification). If set to 0
+// (default), we will dynamically choose the WAL size limit to be
+// [sum of all write_buffer_size * max_write_buffer_number] * 2
+// Default: 0
+func (self *Options) SetMaxTotalWALSize(value uint64) {
+	C.rocksdb_options_set_max_total_wal_size(self.c, C.uint64_t(value))
+}
+
 // Compress blocks using the specified compression algorithm. This
 // parameter can be changed dynamically.
 //
