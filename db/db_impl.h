@@ -12,7 +12,9 @@
 #include <deque>
 #include <limits>
 #include <set>
+#include <list>
 #include <utility>
+#include <list>
 #include <vector>
 #include <string>
 
@@ -32,11 +34,11 @@
 #include "util/stop_watch.h"
 #include "util/thread_local.h"
 #include "util/scoped_arena_iterator.h"
+#include "util/hash.h"
 #include "db/internal_stats.h"
 #include "db/write_controller.h"
 #include "db/flush_scheduler.h"
 #include "db/write_thread.h"
-#include "db/job_context.h"
 
 namespace rocksdb {
 
@@ -47,6 +49,7 @@ class VersionEdit;
 class VersionSet;
 class CompactionFilterV2;
 class Arena;
+struct JobContext;
 
 class DBImpl : public DB {
  public:
@@ -114,6 +117,13 @@ class DBImpl : public DB {
                               bool reduce_level = false, int target_level = -1,
                               uint32_t target_path_id = 0);
 
+  using DB::CompactFiles;
+  virtual Status CompactFiles(
+      const CompactionOptions& compact_options,
+      ColumnFamilyHandle* column_family,
+      const std::vector<std::string>& input_file_names,
+      const int output_level, const int output_path_id = -1);
+
   using DB::SetOptions;
   Status SetOptions(ColumnFamilyHandle* column_family,
       const std::unordered_map<std::string, std::string>& options_map);
@@ -151,6 +161,15 @@ class DBImpl : public DB {
   virtual Status DeleteFile(std::string name);
 
   virtual void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata);
+
+  // Obtains the meta data of the specified column family of the DB.
+  // Status::NotFound() will be returned if the current DB does not have
+  // any column family match the specified name.
+  // TODO(yhchiang): output parameter is placed in the end in this codebase.
+  virtual void GetColumnFamilyMetaData(
+      ColumnFamilyHandle* column_family,
+      ColumnFamilyMetaData* metadata) override;
+
 #endif  // ROCKSDB_LITE
 
   // checks if all live files exist on file system and that their file sizes
@@ -210,7 +229,7 @@ class DBImpl : public DB {
   // REQUIRES: mutex locked
   // pass the pointer that you got from TEST_BeginWrite()
   void TEST_EndWrite(void* w);
-#endif  // NDEBUG
+#endif  // ROCKSDB_LITE
 
   // Returns the list of live files in 'live' and the list
   // of all files in the filesystem in 'candidate_files'.
@@ -238,6 +257,15 @@ class DBImpl : public DB {
   Iterator* NewInternalIterator(const ReadOptions&, ColumnFamilyData* cfd,
                                 SuperVersion* super_version, Arena* arena);
 
+  void NotifyOnFlushCompleted(ColumnFamilyData* cfd, uint64_t file_number,
+                              const MutableCFOptions& mutable_cf_options);
+
+  void NewThreadStatusCfInfo(ColumnFamilyData* cfd) const;
+
+  void EraseThreadStatusCfInfo(ColumnFamilyData* cfd) const;
+
+  void EraseThreadStatusDbInfo() const;
+
  private:
   friend class DB;
   friend class InternalStats;
@@ -264,6 +292,24 @@ class DBImpl : public DB {
 
   // Delete any unneeded files and stale in-memory entries.
   void DeleteObsoleteFiles();
+
+  // Background process needs to call
+  //     auto x = CaptureCurrentFileNumberInPendingOutputs()
+  //     <do something>
+  //     ReleaseFileNumberFromPendingOutputs(x)
+  // This will protect any temporary files created while <do something> is
+  // executing from being deleted.
+  // -----------
+  // This function will capture current file number and append it to
+  // pending_outputs_. This will prevent any background process to delete any
+  // file created after this point.
+  std::list<uint64_t>::iterator CaptureCurrentFileNumberInPendingOutputs();
+  // This function should be called with the result of
+  // CaptureCurrentFileNumberInPendingOutputs(). It then marks that any file
+  // created between the calls CaptureCurrentFileNumberInPendingOutputs() and
+  // ReleaseFileNumberFromPendingOutputs() can now be deleted (if it's not live
+  // and blocked by any other pending_outputs_ calls)
+  void ReleaseFileNumberFromPendingOutputs(std::list<uint64_t>::iterator v);
 
   // Flush the in-memory write buffer to storage.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful.
@@ -298,6 +344,15 @@ class DBImpl : public DB {
 
   void RecordFlushIOStats();
   void RecordCompactionIOStats();
+
+#ifndef ROCKSDB_LITE
+  Status CompactFilesImpl(
+      const CompactionOptions& compact_options, ColumnFamilyData* cfd,
+      Version* version, const std::vector<std::string>& input_file_names,
+      const int output_level, int output_path_id);
+#endif  // ROCKSDB_LITE
+
+  ColumnFamilyData* GetColumnFamilyDataByName(const std::string& cf_name);
 
   void MaybeScheduleFlushOrCompaction();
   static void BGWorkCompaction(void* db);
@@ -390,10 +445,16 @@ class DBImpl : public DB {
 
   SnapshotList snapshots_;
 
-  // Set of table files to protect from deletion because they are
-  // part of ongoing compactions.
-  // map from pending file number ID to their path IDs.
-  FileNumToPathIdMap pending_outputs_;
+  // For each background job, pending_outputs_ keeps the current file number at
+  // the time that background job started.
+  // FindObsoleteFiles()/PurgeObsoleteFiles() never deletes any file that has
+  // number bigger than any of the file number in pending_outputs_. Since file
+  // numbers grow monotonically, this also means that pending_outputs_ is always
+  // sorted. After a background job is done executing, its file number is
+  // deleted from pending_outputs_, which allows PurgeObsoleteFiles() to clean
+  // it up.
+  // State is protected with db mutex.
+  std::list<uint64_t> pending_outputs_;
 
   // At least one compaction or flush job is pending but not yet scheduled
   // because of the max background thread limit.
@@ -463,6 +524,12 @@ class DBImpl : public DB {
   // Indicate DB was opened successfully
   bool opened_successfully_;
 
+  // The list of registered event listeners.
+  std::list<EventListener*> listeners_;
+
+  // count how many events are currently being notified.
+  int notifying_events_;
+
   // No copying allowed
   DBImpl(const DBImpl&);
   void operator=(const DBImpl&);
@@ -527,9 +594,5 @@ static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
   if (static_cast<V>(*ptr) > maxvalue) *ptr = maxvalue;
   if (static_cast<V>(*ptr) < minvalue) *ptr = minvalue;
 }
-
-// Dump db file summary, implemented in util/
-extern void DumpDBFileSummary(const DBOptions& options,
-                              const std::string& dbname);
 
 }  // namespace rocksdb

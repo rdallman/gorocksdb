@@ -56,8 +56,7 @@ class CompactionJob {
   CompactionJob(Compaction* compaction, const DBOptions& db_options,
                 const MutableCFOptions& mutable_cf_options,
                 const EnvOptions& env_options, VersionSet* versions,
-                port::Mutex* db_mutex, std::atomic<bool>* shutting_down,
-                FileNumToPathIdMap* pending_outputs, LogBuffer* log_buffer,
+                std::atomic<bool>* shutting_down, LogBuffer* log_buffer,
                 Directory* db_directory, Statistics* stats,
                 SnapshotList* snapshot_list, bool is_snapshot_supported,
                 std::shared_ptr<Cache> table_cache,
@@ -76,7 +75,7 @@ class CompactionJob {
   Status Run();
   // REQUIRED: mutex held
   // status is the return of Run()
-  Status Install(Status status);
+  void Install(Status* status, port::Mutex* db_mutex);
 
  private:
   void AllocateCompactionOutputFileNumbers();
@@ -87,14 +86,13 @@ class CompactionJob {
   // Call compaction_filter_v2->Filter() on kv-pairs in compact
   void CallCompactionFilterV2(CompactionFilterV2* compaction_filter_v2);
   Status FinishCompactionOutputFile(Iterator* input);
-  Status InstallCompactionResults();
+  Status InstallCompactionResults(port::Mutex* db_mutex);
   SequenceNumber findEarliestVisibleSnapshot(
       SequenceNumber in, const std::vector<SequenceNumber>& snapshots,
       SequenceNumber* prev_snapshot);
   void RecordCompactionIOStats();
-  void ReleaseCompactionUnusedFileNumbers();
   Status OpenCompactionOutputFile();
-  void CleanupCompaction(Status status);
+  void CleanupCompaction(const Status& status);
 
   // CompactionJob state
   struct CompactionState;
@@ -113,9 +111,7 @@ class CompactionJob {
   const EnvOptions& env_options_;
   Env* env_;
   VersionSet* versions_;
-  port::Mutex* db_mutex_;
   std::atomic<bool>* shutting_down_;
-  FileNumToPathIdMap* pending_outputs_;
   LogBuffer* log_buffer_;
   Directory* db_directory_;
   Statistics* stats_;

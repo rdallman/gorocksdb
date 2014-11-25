@@ -203,7 +203,7 @@ class HashIndexBuilder : public IndexBuilder {
       // copy.
       pending_entry_prefix_ = key_prefix.ToString();
       pending_block_num_ = 1;
-      pending_entry_index_ = current_restart_index_;
+      pending_entry_index_ = static_cast<uint32_t>(current_restart_index_);
     } else {
       // entry number increments when keys share the prefix reside in
       // differnt data blocks.
@@ -234,7 +234,8 @@ class HashIndexBuilder : public IndexBuilder {
   void FlushPendingPrefix() {
     prefix_block_.append(pending_entry_prefix_.data(),
                          pending_entry_prefix_.size());
-    PutVarint32(&prefix_meta_block_, pending_entry_prefix_.size());
+    PutVarint32(&prefix_meta_block_,
+                static_cast<uint32_t>(pending_entry_prefix_.size()));
     PutVarint32(&prefix_meta_block_, pending_entry_index_);
     PutVarint32(&prefix_meta_block_, pending_block_num_);
   }
@@ -256,6 +257,9 @@ class HashIndexBuilder : public IndexBuilder {
 
   uint64_t current_restart_index_ = 0;
 };
+
+// Without anonymous namespace here, we fail the warning -Wmissing-prototypes
+namespace {
 
 // Create a index builder based on its type.
 IndexBuilder* CreateIndexBuilder(IndexType type, const Comparator* comparator,
@@ -350,6 +354,8 @@ Slice CompressBlock(const Slice& raw,
   *type = kNoCompression;
   return raw;
 }
+
+}  // namespace
 
 // kBlockBasedTableMagicNumber was picked by running
 //    echo rocksdb.table.block_based | sha1sum
@@ -596,7 +602,8 @@ void BlockBasedTableBuilder::WriteRawBlock(const Slice& block_contents,
       }
       case kxxHash: {
         void* xxh = XXH32_init(0);
-        XXH32_update(xxh, block_contents.data(), block_contents.size());
+        XXH32_update(xxh, block_contents.data(),
+                     static_cast<uint32_t>(block_contents.size()));
         XXH32_update(xxh, trailer, 1);  // Extend  to cover block type
         EncodeFixed32(trailer_without_type, XXH32_digest(xxh));
         break;
@@ -658,7 +665,7 @@ Status BlockBasedTableBuilder::InsertBlockInCache(const Slice& block_contents,
     block_cache_compressed->Release(cache_handle);
 
     // Invalidate OS cache.
-    r->file->InvalidateCache(r->offset, size);
+    r->file->InvalidateCache(static_cast<size_t>(r->offset), size);
   }
   return Status::OK();
 }

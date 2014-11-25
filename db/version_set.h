@@ -94,7 +94,7 @@ class VersionStorageInfo {
 
   void Reserve(int level, size_t size) { files_[level].reserve(size); }
 
-  void MaybeAddFile(int level, FileMetaData* f);
+  void AddFile(int level, FileMetaData* f);
 
   void SetFinalized() { finalized_ = true; }
 
@@ -127,9 +127,6 @@ class VersionStorageInfo {
   void UpdateFilesBySize();
 
   int MaxInputLevel() const;
-
-  // Returns true iff some level needs a compaction.
-  bool NeedsCompaction() const;
 
   // Returns the maxmimum compaction score for levels 1 to max
   double max_compaction_score() const { return max_compaction_score_; }
@@ -194,7 +191,7 @@ class VersionStorageInfo {
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
   int NumLevelFiles(int level) const {
     assert(finalized_);
-    return files_[level].size();
+    return static_cast<int>(files_[level].size());
   }
 
   // Return the combined file size of all files at the specified level.
@@ -206,6 +203,7 @@ class VersionStorageInfo {
   }
 
   const rocksdb::LevelFilesBrief& LevelFilesBrief(int level) const {
+    assert(level < static_cast<int>(level_files_brief_.size()));
     return level_files_brief_[level];
   }
 
@@ -420,6 +418,8 @@ class Version {
 
   VersionSet* version_set() { return vset_; }
 
+  void GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta);
+
  private:
   friend class VersionSet;
 
@@ -530,17 +530,10 @@ class VersionSet {
     return pending_manifest_file_number_;
   }
 
-  // Allocate and return a new file number
-  uint64_t NewFileNumber() { return next_file_number_++; }
+  uint64_t current_next_file_number() const { return next_file_number_.load(); }
 
-  // Arrange to reuse "file_number" unless a newer file number has
-  // already been allocated.
-  // REQUIRES: "file_number" was returned by a call to NewFileNumber().
-  void ReuseLogFileNumber(uint64_t file_number) {
-    if (next_file_number_ == file_number + 1) {
-      next_file_number_ = file_number;
-    }
-  }
+  // Allocate and return a new file number
+  uint64_t NewFileNumber() { return next_file_number_.fetch_add(1); }
 
   // Return the last sequence number.
   uint64_t LastSequence() const {
@@ -554,7 +547,8 @@ class VersionSet {
   }
 
   // Mark the specified file number as used.
-  void MarkFileNumberUsed(uint64_t number);
+  // REQUIRED: this is only called during single-threaded recovery
+  void MarkFileNumberUsedDuringRecovery(uint64_t number);
 
   // Return the log file number for the log file that is currently
   // being compacted, or zero if there is no such log file.
@@ -595,7 +589,7 @@ class VersionSet {
   Status GetMetadataForFile(uint64_t number, int* filelevel,
                             FileMetaData** metadata, ColumnFamilyData** cfd);
 
-  void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata);
+  void GetLiveFilesMetaData(std::vector<LiveFileMetaData> *metadata);
 
   void GetObsoleteFiles(std::vector<FileMetaData*>* files);
 
@@ -606,6 +600,7 @@ class VersionSet {
   struct ManifestWriter;
 
   friend class Version;
+  friend class DBImpl;
 
   struct LogReporter : public log::Reader::Reporter {
     Status* status;
@@ -630,7 +625,7 @@ class VersionSet {
   Env* const env_;
   const std::string dbname_;
   const DBOptions* const db_options_;
-  uint64_t next_file_number_;
+  std::atomic<uint64_t> next_file_number_;
   uint64_t manifest_file_number_;
   uint64_t pending_manifest_file_number_;
   std::atomic<uint64_t> last_sequence_;

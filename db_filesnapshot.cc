@@ -19,12 +19,14 @@
 #include <stdint.h>
 #include "db/db_impl.h"
 #include "db/filename.h"
+#include "db/job_context.h"
 #include "db/version_set.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "port/port.h"
 #include "util/mutexlock.h"
 #include "util/sync_point.h"
+#include "util/file_util.h"
 
 namespace rocksdb {
 
@@ -67,6 +69,7 @@ Status DBImpl::EnableFileDeletions(bool force) {
   if (should_purge_files)  {
     PurgeObsoleteFiles(job_context);
   }
+  job_context.Clean();
   LogFlush(db_options_.info_log);
   return Status::OK();
 }
@@ -134,6 +137,7 @@ Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
 Status DBImpl::GetSortedWalFiles(VectorLogPtr& files) {
   return wal_manager_.GetSortedWalFiles(files);
 }
+
 }
 
 #endif  // ROCKSDB_LITE

@@ -42,6 +42,7 @@
 #include "util/random.h"
 #include "util/iostats_context_imp.h"
 #include "util/rate_limiter.h"
+#include "util/thread_status_impl.h"
 
 // Get nano time for mach systems
 #ifdef __MACH__
@@ -74,6 +75,10 @@
 int rocksdb_kill_odds = 0;
 
 namespace rocksdb {
+
+#if ROCKSDB_USING_THREAD_STATUS
+extern ThreadStatusImpl thread_local_status;
+#endif
 
 namespace {
 
@@ -201,7 +206,7 @@ class PosixSequentialFile: public SequentialFile {
   }
 
   virtual Status Skip(uint64_t n) {
-    if (fseek(file_, n, SEEK_CUR)) {
+    if (fseek(file_, static_cast<long int>(n), SEEK_CUR)) {
       return IOError(filename_, errno);
     }
     return Status::OK();
@@ -486,7 +491,7 @@ class PosixMmapFile : public WritableFile {
     const char* src = data.data();
     size_t left = data.size();
     TEST_KILL_RANDOM(rocksdb_kill_odds * REDUCE_ODDS);
-    PrepareWrite(GetFileSize(), left);
+    PrepareWrite(static_cast<size_t>(GetFileSize()), left);
     while (left > 0) {
       assert(base_ <= dst_);
       assert(dst_ <= limit_);
@@ -683,7 +688,7 @@ class PosixWritableFile : public WritableFile {
 
     TEST_KILL_RANDOM(rocksdb_kill_odds * REDUCE_ODDS2);
 
-    PrepareWrite(GetFileSize(), left);
+    PrepareWrite(static_cast<size_t>(GetFileSize()), left);
     // if there is no space in the cache, then flush
     if (cursize_ + left > capacity_) {
       s = Flush();
@@ -1288,6 +1293,17 @@ class PosixEnv : public Env {
     return result;
   }
 
+  virtual Status LinkFile(const std::string& src, const std::string& target) {
+    Status result;
+    if (link(src.c_str(), target.c_str()) != 0) {
+      if (errno == EXDEV) {
+        return Status::NotSupported("No cross FS links allowed");
+      }
+      result = IOError(src, errno);
+    }
+    return result;
+  }
+
   virtual Status LockFile(const std::string& fname, FileLock** lock) {
     *lock = nullptr;
     Status result;
@@ -1380,7 +1396,7 @@ class PosixEnv : public Env {
   }
 
   virtual Status GetHostName(char* name, uint64_t len) {
-    int ret = gethostname(name, len);
+    int ret = gethostname(name, static_cast<size_t>(len));
     if (ret < 0) {
       if (errno == EFAULT || errno == EINVAL)
         return Status::InvalidArgument(strerror(errno));
@@ -1559,6 +1575,17 @@ class PosixEnv : public Env {
       return static_cast<int>(thread_id) >= total_threads_limit_;
     }
 
+    // Return the thread priority.
+    // This would allow its member-thread to know its priority.
+    Env::Priority GetThreadPriority() {
+      return priority_;
+    }
+
+    // Set the thread priority.
+    void SetThreadPriority(Env::Priority priority) {
+      priority_ = priority;
+    }
+
     void BGThread(size_t thread_id) {
       bool low_io_priority = false;
       while (true) {
@@ -1594,7 +1621,8 @@ class PosixEnv : public Env {
         void (*function)(void*) = queue_.front().function;
         void* arg = queue_.front().arg;
         queue_.pop_front();
-        queue_len_.store(queue_.size(), std::memory_order_relaxed);
+        queue_len_.store(static_cast<unsigned int>(queue_.size()),
+                         std::memory_order_relaxed);
 
         bool decrease_io_priority = (low_io_priority != low_io_priority_);
         PthreadCall("unlock", pthread_mutex_unlock(&mu_));
@@ -1639,8 +1667,14 @@ class PosixEnv : public Env {
       BGThreadMetadata* meta = reinterpret_cast<BGThreadMetadata*>(arg);
       size_t thread_id = meta->thread_id_;
       ThreadPool* tp = meta->thread_pool_;
+      // for thread-status
+      thread_local_status.SetThreadType(
+          (tp->GetThreadPriority() == Env::Priority::HIGH ?
+              ThreadStatus::ThreadType::ROCKSDB_HIGH_PRIORITY :
+              ThreadStatus::ThreadType::ROCKSDB_LOW_PRIORITY));
       delete meta;
       tp->BGThread(thread_id);
+      thread_local_status.UnregisterThread();
       return nullptr;
     }
 
@@ -1709,7 +1743,8 @@ class PosixEnv : public Env {
       queue_.push_back(BGItem());
       queue_.back().function = function;
       queue_.back().arg = arg;
-      queue_len_.store(queue_.size(), std::memory_order_relaxed);
+      queue_len_.store(static_cast<unsigned int>(queue_.size()),
+                       std::memory_order_relaxed);
 
       if (!HasExcessiveThread()) {
         // Wake up at least one waiting thread.
@@ -1740,6 +1775,7 @@ class PosixEnv : public Env {
     std::atomic_uint queue_len_;  // Queue length. Used for stats reporting
     bool exit_all_threads_;
     bool low_io_priority_;
+    Env::Priority priority_;
   };
 
   std::vector<ThreadPool> thread_pools_;
@@ -1754,6 +1790,10 @@ PosixEnv::PosixEnv() : checkedDiskForMmap_(false),
                        page_size_(getpagesize()),
                        thread_pools_(Priority::TOTAL) {
   PthreadCall("mutex_init", pthread_mutex_init(&mu_, nullptr));
+  for (int pool_id = 0; pool_id < Env::Priority::TOTAL; ++pool_id) {
+    thread_pools_[pool_id].SetThreadPriority(
+        static_cast<Env::Priority>(pool_id));
+  }
 }
 
 void PosixEnv::Schedule(void (*function)(void*), void* arg, Priority pri) {

@@ -71,7 +71,6 @@ struct CompactionJob::CompactionState {
     SequenceNumber smallest_seqno, largest_seqno;
   };
   std::vector<Output> outputs;
-  std::list<uint64_t> allocated_file_numbers;
 
   // State kept for output being generated
   std::unique_ptr<WritableFile> outfile;
@@ -204,8 +203,7 @@ struct CompactionJob::CompactionState {
 CompactionJob::CompactionJob(
     Compaction* compaction, const DBOptions& db_options,
     const MutableCFOptions& mutable_cf_options, const EnvOptions& env_options,
-    VersionSet* versions, port::Mutex* db_mutex,
-    std::atomic<bool>* shutting_down, FileNumToPathIdMap* pending_outputs,
+    VersionSet* versions, std::atomic<bool>* shutting_down,
     LogBuffer* log_buffer, Directory* db_directory, Statistics* stats,
     SnapshotList* snapshots, bool is_snapshot_supported,
     std::shared_ptr<Cache> table_cache,
@@ -217,9 +215,7 @@ CompactionJob::CompactionJob(
       env_options_(env_options),
       env_(db_options.env),
       versions_(versions),
-      db_mutex_(db_mutex),
       shutting_down_(shutting_down),
-      pending_outputs_(pending_outputs),
       log_buffer_(log_buffer),
       db_directory_(db_directory),
       stats_(stats),
@@ -229,13 +225,13 @@ CompactionJob::CompactionJob(
       yield_callback_(std::move(yield_callback)) {}
 
 void CompactionJob::Prepare() {
-  db_mutex_->AssertHeld();
   compact_->CleanupBatchBuffer();
   compact_->CleanupMergedBuffer();
 
   // Generate file_levels_ for compaction berfore making Iterator
   compact_->compaction->GenerateFileLevels();
   ColumnFamilyData* cfd = compact_->compaction->column_family_data();
+  assert(cfd != nullptr);
   LogToBuffer(
       log_buffer_, "[%s] Compacting %d@%d + %d@%d files, score %.2f",
       cfd->GetName().c_str(), compact_->compaction->num_input_files(0),
@@ -269,9 +265,6 @@ void CompactionJob::Prepare() {
 
   // Is this compaction producing files at the bottommost level?
   bottommost_level_ = compact_->compaction->BottomMostLevel();
-
-  // Allocate the output file numbers before we release the lock
-  AllocateCompactionOutputFileNumbers();
 }
 
 Status CompactionJob::Run() {
@@ -392,17 +385,22 @@ Status CompactionJob::Run() {
         compact_->MergeKeyValueSliceBuffer(&cfd->internal_comparator());
 
         status = ProcessKeyValueCompaction(&imm_micros, input.get(), true);
+        if (!status.ok()) {
+          break;
+        }
 
         compact_->CleanupBatchBuffer();
         compact_->CleanupMergedBuffer();
       }
     }  // done processing all prefix batches
     // finish the last batch
-    if (compact_->key_str_buf_.size() > 0) {
-      CallCompactionFilterV2(compaction_filter_v2);
+    if (status.ok()) {
+      if (compact_->key_str_buf_.size() > 0) {
+        CallCompactionFilterV2(compaction_filter_v2);
+      }
+      compact_->MergeKeyValueSliceBuffer(&cfd->internal_comparator());
+      status = ProcessKeyValueCompaction(&imm_micros, input.get(), true);
     }
-    compact_->MergeKeyValueSliceBuffer(&cfd->internal_comparator());
-    status = ProcessKeyValueCompaction(&imm_micros, input.get(), true);
   }  // checking for compaction filter v2
 
   if (status.ok() &&
@@ -423,32 +421,33 @@ Status CompactionJob::Run() {
   }
 
   compaction_stats_.micros = env_->NowMicros() - start_micros - imm_micros;
-  compaction_stats_.files_in_leveln = compact_->compaction->num_input_files(0);
+  compaction_stats_.files_in_leveln =
+      static_cast<int>(compact_->compaction->num_input_files(0));
   compaction_stats_.files_in_levelnp1 =
-      compact_->compaction->num_input_files(1);
+      static_cast<int>(compact_->compaction->num_input_files(1));
   MeasureTime(stats_, COMPACTION_TIME, compaction_stats_.micros);
 
-  int num_output_files = compact_->outputs.size();
+  size_t num_output_files = compact_->outputs.size();
   if (compact_->builder != nullptr) {
     // An error occurred so ignore the last output.
     assert(num_output_files > 0);
     --num_output_files;
   }
-  compaction_stats_.files_out_levelnp1 = num_output_files;
+  compaction_stats_.files_out_levelnp1 = static_cast<int>(num_output_files);
 
-  for (int i = 0; i < compact_->compaction->num_input_files(0); i++) {
+  for (size_t i = 0; i < compact_->compaction->num_input_files(0); i++) {
     compaction_stats_.bytes_readn +=
         compact_->compaction->input(0, i)->fd.GetFileSize();
     compaction_stats_.num_input_records +=
         static_cast<uint64_t>(compact_->compaction->input(0, i)->num_entries);
   }
 
-  for (int i = 0; i < compact_->compaction->num_input_files(1); i++) {
+  for (size_t i = 0; i < compact_->compaction->num_input_files(1); i++) {
     compaction_stats_.bytes_readnp1 +=
         compact_->compaction->input(1, i)->fd.GetFileSize();
   }
 
-  for (int i = 0; i < num_output_files; i++) {
+  for (size_t i = 0; i < num_output_files; i++) {
     compaction_stats_.bytes_written += compact_->outputs[i].file_size;
   }
   if (compact_->num_input_records > compact_->num_output_records) {
@@ -463,18 +462,14 @@ Status CompactionJob::Run() {
   return status;
 }
 
-Status CompactionJob::Install(Status status) {
-  db_mutex_->AssertHeld();
+void CompactionJob::Install(Status* status, port::Mutex* db_mutex) {
+  db_mutex->AssertHeld();
   ColumnFamilyData* cfd = compact_->compaction->column_family_data();
   cfd->internal_stats()->AddCompactionStats(
       compact_->compaction->output_level(), compaction_stats_);
 
-  // if there were any unused file number (mostly in case of
-  // compaction error), free up the entry from pending_putputs
-  ReleaseCompactionUnusedFileNumbers();
-
-  if (status.ok()) {
-    status = InstallCompactionResults();
+  if (status->ok()) {
+    *status = InstallCompactionResults(db_mutex);
   }
   VersionStorageInfo::LevelSummaryStorage tmp;
   const auto& stats = compaction_stats_;
@@ -495,26 +490,10 @@ Status CompactionJob::Install(Status status) {
               (stats.bytes_written + stats.bytes_readnp1 + stats.bytes_readn) /
                   static_cast<double>(stats.bytes_readn),
               stats.bytes_written / static_cast<double>(stats.bytes_readn),
-              status.ToString().c_str(), stats.num_input_records,
+              status->ToString().c_str(), stats.num_input_records,
               stats.num_dropped_records);
 
-  CleanupCompaction(status);
-  return status;
-}
-
-// Allocate the file numbers for the output file. We allocate as
-// many output file numbers as there are files in level+1 (at least one)
-// Insert them into pending_outputs so that they do not get deleted.
-void CompactionJob::AllocateCompactionOutputFileNumbers() {
-  db_mutex_->AssertHeld();
-  assert(compact_->builder == nullptr);
-  int filesNeeded = compact_->compaction->num_input_files(1);
-  for (int i = 0; i < std::max(filesNeeded, 1); i++) {
-    uint64_t file_number = versions_->NewFileNumber();
-    pending_outputs_->insert(
-        {file_number, compact_->compaction->GetOutputPathId()});
-    compact_->allocated_file_numbers.push_back(file_number);
-  }
+  CleanupCompaction(*status);
 }
 
 Status CompactionJob::ProcessKeyValueCompaction(int64_t* imm_micros,
@@ -889,7 +868,8 @@ void CompactionJob::CallCompactionFilterV2(
   assert(compact_->to_delete_buf_.size() == compact_->key_str_buf_.size());
   assert(compact_->to_delete_buf_.size() ==
          compact_->existing_value_str_buf_.size());
-  assert(compact_->to_delete_buf_.size() ==
+  assert(compact_->value_changed_buf_.empty() ||
+         compact_->to_delete_buf_.size() ==
          compact_->value_changed_buf_.size());
 
   int new_value_idx = 0;
@@ -904,7 +884,8 @@ void CompactionJob::CallCompactionFilterV2(
       // no value associated with delete
       compact_->existing_value_str_buf_[i].clear();
       RecordTick(stats_, COMPACTION_KEY_DROP_USER);
-    } else if (compact_->value_changed_buf_[i]) {
+    } else if (!compact_->value_changed_buf_.empty() &&
+        compact_->value_changed_buf_[i]) {
       compact_->existing_value_str_buf_[i] =
           compact_->new_value_buf_[new_value_idx++];
     }
@@ -966,8 +947,8 @@ Status CompactionJob::FinishCompactionOutputFile(Iterator* input) {
   return s;
 }
 
-Status CompactionJob::InstallCompactionResults() {
-  db_mutex_->AssertHeld();
+Status CompactionJob::InstallCompactionResults(port::Mutex* db_mutex) {
+  db_mutex->AssertHeld();
 
   // paranoia: verify that the files that we started with
   // still exist in the current version and in the same original level.
@@ -1003,7 +984,7 @@ Status CompactionJob::InstallCompactionResults() {
   }
   return versions_->LogAndApply(
       compact_->compaction->column_family_data(), mutable_cf_options_,
-      compact_->compaction->edit(), db_mutex_, db_directory_);
+      compact_->compaction->edit(), db_mutex, db_directory_);
 }
 
 // Given a sequence number, return the sequence number of the
@@ -1015,6 +996,7 @@ Status CompactionJob::InstallCompactionResults() {
 inline SequenceNumber CompactionJob::findEarliestVisibleSnapshot(
     SequenceNumber in, const std::vector<SequenceNumber>& snapshots,
     SequenceNumber* prev_snapshot) {
+  assert(snapshots.size());
   SequenceNumber prev __attribute__((unused)) = 0;
   for (const auto cur : snapshots) {
     assert(prev <= cur);
@@ -1041,31 +1023,11 @@ void CompactionJob::RecordCompactionIOStats() {
   IOSTATS_RESET(bytes_written);
 }
 
-// Frees up unused file number.
-void CompactionJob::ReleaseCompactionUnusedFileNumbers() {
-  db_mutex_->AssertHeld();
-  for (const auto file_number : compact_->allocated_file_numbers) {
-    pending_outputs_->erase(file_number);
-  }
-}
-
 Status CompactionJob::OpenCompactionOutputFile() {
   assert(compact_ != nullptr);
   assert(compact_->builder == nullptr);
-  uint64_t file_number;
-  // If we have not yet exhausted the pre-allocated file numbers,
-  // then use the one from the front. Otherwise, we have to acquire
-  // the heavyweight lock and allocate a new file number.
-  if (!compact_->allocated_file_numbers.empty()) {
-    file_number = compact_->allocated_file_numbers.front();
-    compact_->allocated_file_numbers.pop_front();
-  } else {
-    db_mutex_->Lock();
-    file_number = versions_->NewFileNumber();
-    pending_outputs_->insert(
-        {file_number, compact_->compaction->GetOutputPathId()});
-    db_mutex_->Unlock();
-  }
+  // no need to lock because VersionSet::next_file_number_ is atomic
+  uint64_t file_number = versions_->NewFileNumber();
   // Make the output file
   std::string fname = TableFileName(db_options_.db_paths, file_number,
                                     compact_->compaction->GetOutputPathId());
@@ -1089,8 +1051,8 @@ Status CompactionJob::OpenCompactionOutputFile() {
 
   compact_->outputs.push_back(out);
   compact_->outfile->SetIOPriority(Env::IO_LOW);
-  compact_->outfile->SetPreallocationBlockSize(
-      compact_->compaction->OutputFilePreallocationSize(mutable_cf_options_));
+  compact_->outfile->SetPreallocationBlockSize(static_cast<size_t>(
+      compact_->compaction->OutputFilePreallocationSize(mutable_cf_options_)));
 
   ColumnFamilyData* cfd = compact_->compaction->column_family_data();
   compact_->builder.reset(NewTableBuilder(
@@ -1101,8 +1063,7 @@ Status CompactionJob::OpenCompactionOutputFile() {
   return s;
 }
 
-void CompactionJob::CleanupCompaction(Status status) {
-  db_mutex_->AssertHeld();
+void CompactionJob::CleanupCompaction(const Status& status) {
   if (compact_->builder != nullptr) {
     // May happen if we get a shutdown call in the middle of compaction
     compact_->builder->Abandon();
@@ -1112,7 +1073,6 @@ void CompactionJob::CleanupCompaction(Status status) {
   }
   for (size_t i = 0; i < compact_->outputs.size(); i++) {
     const CompactionState::Output& out = compact_->outputs[i];
-    pending_outputs_->erase(out.number);
 
     // If this file was inserted into the table cache then remove
     // them here because this compaction was not committed.

@@ -10,13 +10,16 @@
 #define STORAGE_ROCKSDB_INCLUDE_OPTIONS_H_
 
 #include <stddef.h>
+#include <stdint.h>
 #include <string>
 #include <memory>
 #include <vector>
+#include <limits>
 #include <stdint.h>
 #include <unordered_map>
 
 #include "rocksdb/version.h"
+#include "rocksdb/listener.h"
 #include "rocksdb/universal_compaction.h"
 
 namespace rocksdb {
@@ -55,9 +58,10 @@ enum CompressionType : char {
 enum CompactionStyle : char {
   kCompactionStyleLevel = 0x0,      // level based compaction style
   kCompactionStyleUniversal = 0x1,  // Universal compaction style
-  kCompactionStyleFIFO = 0x2,       // FIFO compaction style
+  kCompactionStyleFIFO = 0x2,    // FIFO compaction style
+  kCompactionStyleNone = 0x3,  // Disable background compaction. Compaction
+                               // jobs are submitted via CompactFiles()
 };
-
 
 struct CompactionOptionsFIFO {
   // once the total sum of table files reaches this, we will delete the oldest
@@ -97,6 +101,7 @@ struct Options;
 struct ColumnFamilyOptions {
   // Some functions that make it easier to optimize RocksDB
 
+#ifndef ROCKSDB_LITE
   // Use this if you don't need to keep the data sorted, i.e. you'll never use
   // an iterator, only Put() and Get() API calls
   ColumnFamilyOptions* OptimizeForPointLookup(
@@ -120,6 +125,7 @@ struct ColumnFamilyOptions {
       uint64_t memtable_memory_budget = 512 * 1024 * 1024);
   ColumnFamilyOptions* OptimizeUniversalStyleCompaction(
       uint64_t memtable_memory_budget = 512 * 1024 * 1024);
+#endif  // ROCKSDB_LITE
 
   // -------------------
   // Parameters that affect behavior
@@ -415,7 +421,10 @@ struct ColumnFamilyOptions {
 
   // If true, compaction will verify checksum on every read that happens
   // as part of compaction
+  //
   // Default: true
+  //
+  // Dynamically changeable through SetOptions() API
   bool verify_checksums_in_compaction;
 
   // The options needed to support Universal Style compactions
@@ -586,6 +595,12 @@ struct ColumnFamilyOptions {
   // Default: 2
   uint32_t min_partial_merge_operands;
 
+#ifndef ROCKSDB_LITE
+  // A vector of EventListeners which call-back functions will be called
+  // when specific RocksDB event happens.
+  std::vector<std::shared_ptr<EventListener>> listeners;
+#endif  // ROCKSDB_LITE
+
   // Create ColumnFamilyOptions with default values for all fields
   ColumnFamilyOptions();
   // Create ColumnFamilyOptions from Options
@@ -597,12 +612,14 @@ struct ColumnFamilyOptions {
 struct DBOptions {
   // Some functions that make it easier to optimize RocksDB
 
+#ifndef ROCKSDB_LITE
   // By default, RocksDB uses only one background thread for flush and
   // compaction. Calling this function will set it up such that total of
   // `total_threads` is used. Good value for `total_threads` is the number of
   // cores. You almost definitely want to call this function if your system is
   // bottlenecked by RocksDB.
   DBOptions* IncreaseParallelism(int total_threads = 16);
+#endif  // ROCKSDB_LITE
 
   // If true, the database will be created if it is missing.
   // Default: false
@@ -616,14 +633,11 @@ struct DBOptions {
   // Default: false
   bool error_if_exists;
 
-  // If true, the implementation will do aggressive checking of the
-  // data it is processing and will stop early if it detects any
-  // errors.  This may have unforeseen ramifications: for example, a
-  // corruption of one DB entry may cause a large number of entries to
-  // become unreadable or for the entire DB to become unopenable.
-  // If any of the  writes to the database fails (Put, Delete, Merge, Write),
-  // the database will switch to read-only mode and fail all other
+  // If true, RocksDB will aggressively check consistency of the data.
+  // Also, if any of the  writes to the database fails (Put, Delete, Merge,
+  // Write), the database will switch to read-only mode and fail all other
   // Write operations.
+  // In most cases you want this to be set to true.
   // Default: true
   bool paranoid_checks;
 
@@ -870,6 +884,12 @@ struct DBOptions {
   // When rate limiter is enabled, it automatically enables bytes_per_sync
   // to 1MB.
   uint64_t bytes_per_sync;
+
+  // If true, then the status of the threads involved in this DB will
+  // be tracked and available via GetThreadList() API.
+  //
+  // Default: false
+  bool enable_thread_tracking;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -1067,6 +1087,19 @@ extern Options GetOptions(size_t total_write_buffer_limit,
                           int write_amplification_threshold = 32,
                           uint64_t target_db_size = 68719476736 /* 64GB */);
 
+// CompactionOptions are used in CompactFiles() call.
+struct CompactionOptions {
+  // Compaction output compression type
+  // Default: snappy
+  CompressionType compression;
+  // Compaction will create files of size `output_file_size_limit`.
+  // Default: MAX, which means that compaction will create a single file
+  uint64_t output_file_size_limit;
+
+  CompactionOptions()
+      : compression(kSnappyCompression),
+        output_file_size_limit(std::numeric_limits<uint64_t>::max()) {}
+};
 }  // namespace rocksdb
 
 #endif  // STORAGE_ROCKSDB_INCLUDE_OPTIONS_H_

@@ -52,6 +52,7 @@ class ColumnFamilyHandleImpl : public ColumnFamilyHandle {
   virtual const Comparator* user_comparator() const;
 
   virtual uint32_t GetID() const;
+  virtual const std::string& GetName() const override;
 
  private:
   ColumnFamilyData* cfd_;
@@ -171,8 +172,10 @@ class ColumnFamilyData {
   void SetLogNumber(uint64_t log_number) { log_number_ = log_number; }
   uint64_t GetLogNumber() const { return log_number_; }
 
-  // thread-safe
+  // !!! To be deprecated! Please don't not use this function anymore!
   const Options* options() const { return &options_; }
+
+  // thread-safe
   const EnvOptions* soptions() const;
   const ImmutableCFOptions* ioptions() const { return &ioptions_; }
   // REQUIRES: DB mutex held
@@ -186,9 +189,11 @@ class ColumnFamilyData {
   const MutableCFOptions* GetLatestMutableCFOptions() const {
     return &mutable_cf_options_;
   }
+#ifndef ROCKSDB_LITE
   // REQUIRES: DB mutex held
   Status SetOptions(
       const std::unordered_map<std::string, std::string>& options_map);
+#endif  // ROCKSDB_LITE
 
   InternalStats* internal_stats() { return internal_stats_.get(); }
 
@@ -249,6 +254,11 @@ class ColumnFamilyData {
                                     port::Mutex* db_mutex);
 
   void ResetThreadLocalSuperVersions();
+
+  void NotifyOnFlushCompleted(
+      DB* db, const std::string& file_path,
+      bool triggered_flush_slowdown,
+      bool triggered_flush_stop);
 
  private:
   friend class ColumnFamilySet;
@@ -434,10 +444,6 @@ class ColumnFamilyMemTablesImpl : public ColumnFamilyMemTables {
 
   // REQUIRES: Seek() called first
   virtual MemTable* GetMemTable() const override;
-
-  // Returns options for selected column family
-  // REQUIRES: Seek() called first
-  virtual const Options* GetOptions() const override;
 
   // Returns column family handle for the selected column family
   virtual ColumnFamilyHandle* GetColumnFamilyHandle() override;

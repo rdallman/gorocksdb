@@ -235,7 +235,7 @@ bool InternalStats::GetIntProperty(DBPropertyType property_type,
     case kCompactionPending:
       // 1 if the system already determines at least one compacdtion is needed.
       // 0 otherwise,
-      *value = (vstorage->NeedsCompaction() ? 1 : 0);
+      *value = (cfd_->compaction_picker()->NeedsCompaction(vstorage) ? 1 : 0);
       return true;
     case kBackgroundErrors:
       // Accumulated number of  errors in background flushes or compactions.
@@ -361,8 +361,8 @@ void InternalStats::DumpCFStats(std::string* value) {
   const VersionStorageInfo* vstorage = cfd_->current()->storage_info();
 
   int num_levels_to_check =
-      (cfd_->options()->compaction_style != kCompactionStyleUniversal &&
-       cfd_->options()->compaction_style != kCompactionStyleFIFO)
+      (cfd_->ioptions()->compaction_style != kCompactionStyleUniversal &&
+       cfd_->ioptions()->compaction_style != kCompactionStyleFIFO)
           ? vstorage->num_levels() - 1
           : 1;
 

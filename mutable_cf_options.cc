@@ -110,7 +110,7 @@ void MutableCFOptions::Dump(Logger* log) const {
       expanded_compaction_factor);
   Log(log, "                 source_compaction_factor: %d",
       source_compaction_factor);
-  Log(log, "                    target_file_size_base: %d",
+  Log(log, "                    target_file_size_base: %" PRIu64,
       target_file_size_base);
   Log(log, "              target_file_size_multiplier: %d",
       target_file_size_multiplier);
@@ -128,6 +128,8 @@ void MutableCFOptions::Dump(Logger* log) const {
   Log(log, "max_bytes_for_level_multiplier_additional: %s", result.c_str());
   Log(log, "                 max_mem_compaction_level: %d",
       max_mem_compaction_level);
+  Log(log, "           verify_checksums_in_compaction: %d",
+      verify_checksums_in_compaction);
   Log(log, "        max_sequential_skip_in_iterations: %" PRIu64,
       max_sequential_skip_in_iterations);
 }

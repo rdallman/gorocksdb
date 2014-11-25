@@ -55,13 +55,12 @@ class FlushJob {
            const MutableCFOptions& mutable_cf_options,
            const EnvOptions& env_options, VersionSet* versions,
            port::Mutex* db_mutex, std::atomic<bool>* shutting_down,
-           FileNumToPathIdMap* pending_outputs, SequenceNumber newest_snapshot,
-           JobContext* job_context, LogBuffer* log_buffer,
-           Directory* db_directory, CompressionType output_compression,
-           Statistics* stats);
+           SequenceNumber newest_snapshot, JobContext* job_context,
+           LogBuffer* log_buffer, Directory* db_directory,
+           CompressionType output_compression, Statistics* stats);
   ~FlushJob() {}
 
-  Status Run();
+  Status Run(uint64_t* file_number = nullptr);
 
  private:
   Status WriteLevel0Table(const autovector<MemTable*>& mems, VersionEdit* edit,
@@ -74,7 +73,6 @@ class FlushJob {
   VersionSet* versions_;
   port::Mutex* db_mutex_;
   std::atomic<bool>* shutting_down_;
-  FileNumToPathIdMap* pending_outputs_;
   SequenceNumber newest_snapshot_;
   JobContext* job_context_;
   LogBuffer* log_buffer_;
