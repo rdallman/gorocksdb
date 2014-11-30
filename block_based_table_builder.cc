@@ -304,6 +304,7 @@ bool GoodCompressionRatio(size_t compressed_size, size_t raw_size) {
 Slice CompressBlock(const Slice& raw,
                     const CompressionOptions& compression_options,
                     CompressionType* type, std::string* compressed_output) {
+
   if (*type == kNoCompression) {
     return raw;
   }
