@@ -1,6 +1,7 @@
 package gorocksdb
 
-// #cgo CXXFLAGS: -std=c++11 -DSNAPPY -DROCKSDB_PLATFORM_POSIX
+// #cgo CXXFLAGS: -std=c++11 -DSNAPPY -DROCKSDB_PLATFORM_POSIX -DLZ4
+// #cgo LDFLAGS: -lrt -static-libgcc -static-libstdc++
 // #include <stdlib.h>
 // #include "rocksdb/c.h"
 import "C"

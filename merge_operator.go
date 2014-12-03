@@ -95,7 +95,8 @@ func gorocksdb_mergeoperator_partial_merge_multi(handler *MergeOperator, cKey *C
 	key := charToByte(cKey, cKeyLen)
 	rawOperands := charSlice(cOperands, cNumOperands)
 	operandsLen := sizeSlice(cOperandsLen, cNumOperands)
-	operands := make([][]byte, int(cNumOperands))
+	n := int(cNumOperands)
+	operands := make([][]byte, n)
 	for i, len := range operandsLen {
 		operands[i] = charToByte(rawOperands[i], len)
 	}
@@ -105,7 +106,7 @@ func gorocksdb_mergeoperator_partial_merge_multi(handler *MergeOperator, cKey *C
 
 	h := *handler
 	leftOperand := operands[0]
-	for i := 1; i < int(cNumOperands); i++ {
+	for i := 1; i < n; i++ {
 		newValue, success = h.PartialMerge(key, leftOperand, operands[i])
 		if !success {
 			break
