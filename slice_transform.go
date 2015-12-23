@@ -37,6 +37,10 @@ func NewFixedPrefixTransform(prefixLen int) SliceTransform {
 	return NewNativeSliceTransform(C.rocksdb_slicetransform_create_fixed_prefix(C.size_t(prefixLen)))
 }
 
+func NewNoopTransform() SliceTransform {
+	return NewNativeSliceTransform(C.rocksdb_slicetransform_create_noop())
+}
+
 // NewNativeSliceTransform allocates a SliceTransform object.
 // The SliceTransform's methods are no-ops, but it is still used correctly by
 // RocksDB.

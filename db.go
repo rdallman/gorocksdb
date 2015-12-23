@@ -1,7 +1,9 @@
 package gorocksdb
 
-// #cgo CXXFLAGS: -std=c++11 -DSNAPPY -DROCKSDB_PLATFORM_POSIX -DLZ4
-// #cgo LDFLAGS: -lrt -static-libgcc -static-libstdc++
+// #cgo !darwin CXXFLAGS: -std=c++11 -DSNAPPY -DROCKSDB_PLATFORM_POSIX -DLZ4 -DNDEBUG
+// #cgo !darwin LDFLAGS: -lrt -static-libgcc -static-libstdc++
+// #cgo darwin CXXFLAGS: -std=c++11 -DSNAPPY -DROCKSDB_PLATFORM_POSIX -DLZ4 -DNDEBUG -DOS_MACOSX
+// #cgo darwin LDFLAGS: -static-libstdc++
 // #include <stdlib.h>
 // #include "rocksdb/c.h"
 import "C"
@@ -10,11 +12,6 @@ import (
 	"errors"
 	"unsafe"
 )
-
-// OLD FLAGS BELOW
-// #cgo LDFLAGS: -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy
-// RU
-// #cgo LDFLAGS: -lstdc++ -lm
 
 // Range is a range of keys in the database. GetApproximateSizes calls with it
 // begin at the key Start and end right before the key Limit.
@@ -96,6 +93,53 @@ func (self *DB) Get(opts *ReadOptions, key []byte) (*Slice, error) {
 	}
 
 	return NewSlice(cValue, cValLen), nil
+}
+
+// MultiGet is like Get but for multiple keys at once.
+// The i'th slice returned is for the i'th key. If the value was empty
+// or not found, the slice returned from Data() will be nil and no error
+// will be returned for that value.
+// The list of errors returned will be nil if no errors occurred for any keys,
+// or will be len(keys) in length where the i'th error is an error for retrieval
+// of the i'th key.
+func (self *DB) MultiGet(opts *ReadOptions, keys [][]byte) ([]Slice, []error) {
+	if len(keys) < 1 {
+		return nil, nil
+	}
+
+	n := len(keys)
+	chars := make([]*C.char, 3*n)
+	keys_list := chars[:n]
+	vals_list := chars[n : 2*n]
+	c_errs := chars[2*n:]
+
+	sizes := make([]C.size_t, 2*n)
+	keys_sizes_list := sizes[:n]
+	vals_sizes_list := sizes[n:]
+	for i, key := range keys {
+		keys_list[i] = byteToChar(key)
+		keys_sizes_list[i] = C.size_t(len(key))
+	}
+
+	C.rocksdb_multi_get(self.c, opts.c, C.size_t(n), (**C.char)(unsafe.Pointer(&keys_list[0])),
+		(*C.size_t)(unsafe.Pointer(&keys_sizes_list[0])), (**C.char)(unsafe.Pointer(&vals_list[0])),
+		(*C.size_t)(unsafe.Pointer(&vals_sizes_list[0])), (**C.char)(unsafe.Pointer(&c_errs[0])))
+
+	slices := make([]Slice, n)
+	var errs []error
+
+	for i := range keys {
+		slices[i] = Slice{data: vals_list[i], size: vals_sizes_list[i]}
+		if c_errs[i] != nil {
+			if errs == nil {
+				errs = make([]error, n)
+			}
+			errs[i] = errors.New(C.GoString(c_errs[i]))
+			C.free(unsafe.Pointer(c_errs[i]))
+		}
+	}
+
+	return slices, errs
 }
 
 // Put writes data associated with a key to the database.

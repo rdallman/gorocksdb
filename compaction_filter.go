@@ -1,6 +1,7 @@
 package gorocksdb
 
 // #include "rocksdb/c.h"
+// #include "gorocksdb.h"
 import "C"
 
 type CompactionFilter interface {

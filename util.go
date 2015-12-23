@@ -7,6 +7,13 @@ import (
 	"unsafe"
 )
 
+func ctob(b C.uchar) bool {
+	if b == 0 {
+		return false
+	}
+	return true
+}
+
 // btoi converts a bool value to int
 func btoi(b bool) int {
 	if b {
@@ -47,6 +54,15 @@ func stringToChar(s string) *C.char {
 	ptrStr := (*reflect.StringHeader)(unsafe.Pointer(&s))
 
 	return (*C.char)(unsafe.Pointer(ptrStr.Data))
+}
+
+func ucharSlice(data *C.uchar, len C.int) []C.uchar {
+	var value []C.uchar
+
+	sH := (*reflect.SliceHeader)(unsafe.Pointer(&value))
+	sH.Cap, sH.Len, sH.Data = int(len), int(len), uintptr(unsafe.Pointer(data))
+
+	return value
 }
 
 // charSlice converts a C array of *char to a []*C.char.

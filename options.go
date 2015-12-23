@@ -14,10 +14,12 @@ import (
 type CompressionType uint
 
 const (
-	NoCompression     = CompressionType(0)
-	SnappyCompression = CompressionType(1)
-	ZlibCompression   = CompressionType(2)
-	BZip2Compression  = CompressionType(3)
+	NoCompression     = CompressionType(int(C.rocksdb_no_compression))
+	SnappyCompression = CompressionType(int(C.rocksdb_snappy_compression))
+	ZlibCompression   = CompressionType(int(C.rocksdb_zlib_compression))
+	BZip2Compression  = CompressionType(int(C.rocksdb_bz2_compression))
+	LZ4Compression    = CompressionType(int(C.rocksdb_lz4_compression))
+	LZ4HCCompression  = CompressionType(int(C.rocksdb_lz4hc_compression))
 )
 
 type CompactionStyle uint
@@ -76,11 +78,20 @@ func NewNativeOptions(c *C.rocksdb_options_t) *Options {
 	return &Options{c: c}
 }
 
-// -------------------
-// Parameters that affect behavior
-
-// If set, the specified compaction filter will be applied
-// on compactions.
+// A single CompactionFilter instance to call into during compaction.
+// Allows an application to modify/delete a key-value during background
+// compaction.
+//
+// If the client requires a new compaction filter to be used for different
+// compaction runs, it can specify compaction_filter_factory instead of this
+// option. The client should specify only one of the two.
+// compaction_filter takes precedence over compaction_filter_factory if
+// client specifies both.
+//
+// If multithreaded compaction is being used, the supplied CompactionFilter
+// instance may be used from different threads concurrently and so should be
+// thread-safe.
+//
 // Default: nil
 func (self *Options) SetCompactionFilter(filter CompactionFilter) {
 	h := unsafe.Pointer(&filter)
@@ -115,25 +126,9 @@ func (self *Options) SetMergeOperator(value MergeOperator) {
 	C.rocksdb_options_set_merge_operator(self.c, self.cmo)
 }
 
-// A single CompactionFilter instance to call into during compaction.
-// Allows an application to modify/delete a key-value during background
-// compaction.
-//
-// If the client requires a new compaction filter to be used for different
-// compaction runs, it can specify compaction_filter_factory instead of this
-// option. The client should specify only one of the two.
-// compaction_filter takes precedence over compaction_filter_factory if
-// client specifies both.
-//
-// If multithreaded compaction is being used, the supplied CompactionFilter
-// instance may be used from different threads concurrently and so should be
-// thread-safe.
-//
-// Default: nil
-// TODO: implement in C
-//func (self *Options) SetCompactionFilter(value *CompactionFilter) {
-//	C.rocksdb_options_set_compaction_filter(self.c, value.filter)
-//}
+func (self *Options) SetMergeOperatorUint64Add() {
+	C.rocksdb_options_set_uint64add_merge_operator(self.c)
+}
 
 // This is a factory that provides compaction filter objects which allow
 // an application to modify/delete a key-value during background compaction.
@@ -144,13 +139,6 @@ func (self *Options) SetMergeOperator(value MergeOperator) {
 //
 // Default: a factory that doesn't provide any object
 // std::shared_ptr<CompactionFilterFactory> compaction_filter_factory;
-// TODO: implement in C and Go
-
-// Version TWO of the compaction_filter_factory
-// It supports rolling compaction
-//
-// Default: a factory that doesn't provide any object
-// std::shared_ptr<CompactionFilterFactoryV2> compaction_filter_factory_v2;
 // TODO: implement in C and Go
 
 // If true, the database will be created if it is missing.

@@ -23,6 +23,17 @@ type BlockBasedTableOptions struct {
 	cfp *C.rocksdb_filterpolicy_t
 }
 
+type BlockBasedTableOptionsIndexCount int
+
+const (
+	// A space efficient index block that is optimized for
+	// binary-search-based index.
+	BinarySearchIndexType = BlockBasedTableOptionsIndexCount(C.rocksdb_block_based_table_index_type_binary_search)
+	// The hash index, if enabled, will do the hash lookup when
+	// `Options.prefix_extractor` is provided.
+	HashSearchIndexType = BlockBasedTableOptionsIndexCount(C.rocksdb_block_based_table_index_type_hash_search)
+)
+
 // NewDefaultBlockBasedTableOptions creates a default BlockBasedTableOptions object.
 func NewDefaultBlockBasedTableOptions() *BlockBasedTableOptions {
 	return NewNativeBlockBasedTableOptions(C.rocksdb_block_based_options_create())
@@ -117,4 +128,42 @@ func (self *BlockBasedTableOptions) SetBlockCacheCompressed(value *Cache) {
 // Default: true
 func (self *BlockBasedTableOptions) SetWholeKeyFiltering(value bool) {
 	C.rocksdb_block_based_options_set_whole_key_filtering(self.c, boolToChar(value))
+}
+
+// We currently have three versions:
+// 0 -- This version is currently written out by all RocksDB's versions by
+// default.  Can be read by really old RocksDB's. Doesn't support changing
+// checksum (default is CRC32).
+// 1 -- Can be read by RocksDB's versions since 3.0. Supports non-default
+// checksum, like xxHash. It is written by RocksDB when
+// BlockBasedTableOptions::checksum is something other than kCRC32c. (version
+// 0 is silently upconverted)
+// 2 -- Can be read by RocksDB's versions since 3.10. Changes the way we
+// encode compressed blocks with LZ4, BZip2 and Zlib compression. If you
+// don't plan to run RocksDB before version 3.10, you should probably use
+// this.
+// This option only affects newly written tables. When reading exising tables,
+// the information about version is read from the footer.
+func (self *BlockBasedTableOptions) SetFormatVersion(value int) {
+	C.rocksdb_block_based_options_set_format_version(self.c, C.int(value))
+}
+
+// The index type that will be used for this table.
+func (self *BlockBasedTableOptions) SetIndexType(value BlockBasedTableOptionsIndexCount) {
+	C.rocksdb_block_based_options_set_index_type(self.c, C.int(value))
+}
+
+// Influence the behavior when kHashSearch is used.
+// if false, stores a precise prefix to block range mapping
+// if true, does not store prefix and allows prefix hash collision
+// (less memory consumption)
+func (self *BlockBasedTableOptions) SetHashIndexAllowCollision(value bool) {
+	C.rocksdb_block_based_options_set_hash_index_allow_collision(self.c, boolToChar(value))
+}
+
+// Indicating if we'd put index/filter blocks to the block cache.
+// If not specified, each "table reader" object will pre-load index/filter
+// block during table initialization.
+func (self *BlockBasedTableOptions) SetCacheIndexAndFilterBlocks(value bool) {
+	C.rocksdb_block_based_options_set_cache_index_and_filter_blocks(self.c, boolToChar(value))
 }
